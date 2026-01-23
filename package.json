@@ -1,0 +1,9 @@
+{
+    "name": "discord-sniper",
+    "version": "1.0.0",
+    "type": "module",
+    "dependencies": {
+        "dotenv": "^16.4.7",
+        "ws": "^8.18.0"
+    }
+}
