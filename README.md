@@ -1,4 +1,4 @@
-# Discord Vanity Sniper (JS Edition) 🚀
+# Discord Vanity Sniper 🚀
 
 This is an advanced, high-performance Discord Vanity URL Sniper written in Node.js. It is designed to bypass modern security measures such as TLS fingerprinting and automated Bot detection.
 
