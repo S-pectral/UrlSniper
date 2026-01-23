@@ -43,9 +43,17 @@ function createTlsSocket() {
     });
 }
 
-function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false) {
+// Retries wrapper for sendHttpRequest
+async function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false, attempt = 1) {
     return new Promise((resolve) => {
         const payload = body ? JSON.stringify(body) : '';
+
+        // If retrying, force a fresh socket
+        if (attempt > 1 && tlsSocket) {
+            try { tlsSocket.destroy(); } catch { }
+            tlsSocket = null;
+        }
+
         if (!tlsSocket || tlsSocket.destroyed || closeConnection) {
             tlsSocket = createTlsSocket();
             tlsSocket.setNoDelay(true);
@@ -70,38 +78,54 @@ function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConn
         headers.push('', payload);
 
         let responseData = '';
-        socket.write(headers.join('\r\n'));
 
-        socket.once('error', (err) => {
-            console.log("Socket Error:", err);
-            resolve('{}');
-        });
+        // Handle socket errors specifically
+        const errorHandler = (err) => {
+            // console.log("Socket Error:", err);
+            // On error, if we haven't retried too many times, try again
+            socket.removeListener('data', dataHandler);
+            socket.removeListener('end', endHandler);
 
-        socket.on('data', (chunk) => {
-            responseData += chunk.toString();
-        });
+            if (attempt <= 3) {
+                // console.log(`[Network] Retrying request (Attempt ${attempt + 1})...`);
+                // Recursively call self with clean socket
+                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1));
+            } else {
+                resolve('{}');
+            }
+        };
 
-        socket.once('end', () => {
+        const dataHandler = (chunk) => { responseData += chunk.toString(); };
+
+        const endHandler = () => {
             try {
                 const separatorIndex = responseData.indexOf('\r\n\r\n');
                 if (separatorIndex === -1) return resolve('{}');
                 let bodyRaw = responseData.slice(separatorIndex + 4);
+
                 const firstTrace = bodyRaw.indexOf('{');
                 const lastTrace = bodyRaw.lastIndexOf('}');
 
                 if (firstTrace !== -1 && lastTrace !== -1 && lastTrace > firstTrace) {
-                    const jsonCand = bodyRaw.substring(firstTrace, lastTrace + 1);
-                    resolve(jsonCand);
+                    resolve(bodyRaw.substring(firstTrace, lastTrace + 1));
                 } else {
                     resolve('{}');
                 }
             } catch (e) {
-                console.log("Parse Error:", e);
                 resolve('{}');
             } finally {
                 if (closeConnection) socket.destroy();
+                // Clean up listeners
+                socket.removeListener('error', errorHandler);
+                socket.removeListener('data', dataHandler);
             }
-        });
+        };
+
+        socket.once('error', errorHandler);
+        socket.on('data', dataHandler);
+        socket.once('end', endHandler);
+
+        socket.write(headers.join('\r\n'));
     });
 }
 
@@ -135,7 +159,7 @@ async function authenticateMfa() {
             }
         } else if (patchData.code === 200) {
             console.log("\x1b[32m!!! SUCCESS !!! Vanity claimed directly (No MFA needed).\x1b[0m");
-            process.exit(0);
+            return "ALREADY_CLAIMED";
         } else {
             // let tryClaim handle it
         }
@@ -145,11 +169,22 @@ async function authenticateMfa() {
     return null;
 }
 
-async function tryClaim(mfaToken, code = VANITY_CODE) {
+async function tryClaim(mfaToken, code = VANITY_CODE, keepAlive = false) {
     if (!mfaToken) {
         console.log("\x1b[31m[Claim] Cannot claim without MFA Token!\x1b[0m");
         return;
     }
+
+    // Slight Optimization: Special flag for "Already Claimed"
+    if (mfaToken === "ALREADY_CLAIMED") {
+        if (keepAlive) {
+            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. I will watch this server and re-claim if the URL drops.\x1b[0m");
+            return;
+        } else {
+            process.exit(0);
+        }
+    }
+
     console.log(`\x1b[36m[Sniper] 🔫 Attempting to claim '${code}'...\x1b[0m`);
 
     // STRATEGY 1: Specific Endpoint
@@ -186,8 +221,12 @@ async function tryClaim(mfaToken, code = VANITY_CODE) {
     const rawSuccess = resp.includes(`"${code}"`) && !resp.includes("errors");
 
     if (isSuccess || rawSuccess) {
-        console.log("\x1b[32m!!! VICTORY !!! URL SNIPED SUCCESSFULLY !\x1b[0m");
-        process.exit(0);
+        console.log(`\x1b[32m!!! VICTORY !!! URL '${code}' SNIPED SUCCESSFULLY !\x1b[0m`);
+        if (keepAlive) {
+            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. I will watch this server and re-claim if the URL drops.\x1b[0m");
+        } else {
+            process.exit(0);
+        }
     } else {
         if (result.code === 50013) {
             console.log("\x1b[31m[Sniper] ⛔ PERMISSION DENIED (50013)\x1b[0m");
@@ -202,7 +241,6 @@ async function tryClaim(mfaToken, code = VANITY_CODE) {
             if (result.id === TARGET_GUILD_ID) {
                 console.log(`\x1b[31m[Sniper] ❌ Server accepted request but didn't update URL.\x1b[0m`);
                 console.log(`\x1b[33mCurrent URL: ${result.vanity_url_code}\x1b[0m`);
-                console.log("\x1b[33mPossible Reasons: Rate Limit / URL Taken / Feature Locked\x1b[0m");
             } else {
                 console.log(`[Sniper] Response: ${resp}`);
             }
@@ -244,7 +282,7 @@ async function modeInstant() {
 
     const token = await authenticateMfa();
     if (token) {
-        await tryClaim(token);
+        await tryClaim(token, VANITY_CODE, false);
         rl.question("\nPress Enter to return...", () => showMenu());
     }
 }
@@ -256,6 +294,10 @@ async function modeGateway() {
     const token = await authenticateMfa();
     if (!token) return;
 
+    // Initial attempt when starting gateway mode
+    await tryClaim(token, VANITY_CODE, true);
+
+    // Then listen
     establishGatewayConnection(token);
 }
 
@@ -285,11 +327,17 @@ function establishGatewayConnection(mfaToken) {
                     ws.send(JSON.stringify({ op: 1, d: latestSequence }));
                 }, packet.d.heartbeat_interval);
             } else if (packet.t === 'GUILD_UPDATE') {
-                console.log("[Gateway] 📡 Guild Update Detected! Trying to claim...");
-                await tryClaim(mfaToken);
+                const g = packet.d;
+                if (g.id === TARGET_GUILD_ID) {
+                    // Start Guard Logic
+                    if (g.vanity_url_code !== VANITY_CODE) {
+                        console.log(`\x1b[31m[Guard] 🚨 ALERT! URL Changed to '${g.vanity_url_code}'! RE-CLAIMING '${VANITY_CODE}' NOW!\x1b[0m`);
+                        await tryClaim(mfaToken, VANITY_CODE, true);
+                    }
+                }
             } else if (packet.t === 'READY') {
                 console.log(`\x1b[32m[Gateway] Ready! Logged in as ${packet.d.user.username}\x1b[0m`);
-                await tryClaim(mfaToken);
+                // No need to spam tryClaim here as modeGateway already does one initial try
             }
         } catch { }
     });
