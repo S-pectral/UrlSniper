@@ -192,10 +192,9 @@ async function authenticateMfa() {
                 sendWebhook("MFA Failed", `Failed to solve MFA challenge.\nError: ${finishData.message}`, 0xFF0000);
                 if (finishData.message) console.log(`\x1b[31m[Error] ${finishData.message} (Code: ${finishData.code})\x1b[0m`);
             }
-        } else if (patchData.code === 200) {
-            console.log("\x1b[32m!!! SUCCESS !!! Vanity claimed directly (No MFA needed).\x1b[0m");
-            sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${VANITY_CODE}\n**Status:** Claimed directly (No MFA).`, 0x00FF00, true);
-            return "ALREADY_CLAIMED";
+        } else if (patchData.code === VANITY_CODE || patchData.code === 200) {
+            console.log("\x1b[32m!!! STATUS !!! Vanity status check successful.\x1b[0m");
+            return "CHECK_COMPLETE";
         } else {
             // let tryClaim handle it
         }
@@ -211,15 +210,9 @@ async function tryClaim(mfaToken, code = VANITY_CODE, keepAlive = false) {
         return false;
     }
 
-    // Slight Optimization: Special flag for "Already Claimed"
-    if (mfaToken === "ALREADY_CLAIMED") {
-        if (keepAlive) {
-            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. I will watch this server and re-claim if the URL drops.\x1b[0m");
-            sendWebhook("🛡️ Guard Mode Active", `Watching for changes to **${code}**...`, 0x0000FF);
-            return true;
-        } else {
-            return true;
-        }
+    // Slight Optimization: Special flag for "Check Complete"
+    if (mfaToken === "CHECK_COMPLETE") {
+        return false; // Just used for auth check
     }
 
     console.log(`\x1b[36m[Sniper] 🔫 Attempting to claim '${code}'...\x1b[0m`);
@@ -327,10 +320,16 @@ async function modeInstant() {
     }
 
     const token = await authenticateMfa();
-    if (token) {
-        const success = await tryClaim(token, VANITY_CODE, false);
-        if (success) process.exit(0);
-        rl.question("\nPress Enter to return...", () => showMenu());
+    if (token && token !== "CHECK_COMPLETE") {
+        console.log(`\x1b[36m[Instant] 🔄 Checking list: ${VANITY_CODES.join(', ')}\x1b[0m`);
+        for (const code of VANITY_CODES) {
+            const success = await tryClaim(token, code, false);
+            if (success) process.exit(0);
+            await new Promise(r => setTimeout(r, 200));
+        }
+        rl.question("\nFinished checklist. Press Enter to return...", () => showMenu());
+    } else {
+        rl.question("\nAuth failed or no action needed. Press Enter...", () => showMenu());
     }
 }
 
@@ -340,17 +339,33 @@ async function modeGateway() {
     if (!guildOK) return;
 
     const token = await authenticateMfa();
-    if (!token) return;
+    if (!token || token === "CHECK_COMPLETE") {
+        // Even if direct check failed, we might want to start listening
+        // but we need a real MFA token for re-claiming if it drops.
+        // If we don't have it, we should probably warn.
+        if (token === "CHECK_COMPLETE") {
+            console.log("\x1b[33m[Gateway] Note: Using Gateway without persistent MFA token might fail re-claims.\x1b[0m");
+        } else return;
+    }
 
-    // Initial attempt when starting gateway mode
-    await tryClaim(token, VANITY_CODE, true);
+    console.log(`\x1b[36m[Gateway] � Monitoring for: ${VANITY_CODES.join(', ')}\x1b[0m`);
 
-    // Then listen
+    // Initial attempt for all
+    for (const code of VANITY_CODES) {
+        const success = await tryClaim(token, code, true);
+        if (success) {
+            establishGatewayConnection(token, code);
+            return;
+        }
+    }
+
+    // Default to watching the primary if none claimed yet
     establishGatewayConnection(token, VANITY_CODE);
 }
 
-async function modeLoop() {
-    sendWebhook("🚀 Sniper Started", `Mode: Multi-Snipe Loop (${VANITY_CODES.join(', ')})`, 0xFFFF00);
+
+async function modeAggressive() {
+    sendWebhook("🚀 Sniper Started", "Mode: Aggressive Mode (High Speed)", 0xFFFF00);
     const guildOK = await verifyGuild();
     if (!guildOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
@@ -360,23 +375,126 @@ async function modeLoop() {
     const token = await authenticateMfa();
     if (!token) return;
 
-    console.log(`\x1b[36m[Loop] 🔄 Starting cycle for: ${VANITY_CODES.join(', ')}\x1b[0m`);
-    console.log("\x1b[33mPress Ctrl+C to stop.\x1b[0m");
+    // Connect Gateway as backup/alert
+    establishGatewayConnection(token, VANITY_CODE);
+
+    console.log(`\x1b[36m[Aggressive] 🚀 STARTING ULTRA 30ms MONITORING\x1b[0m`);
+    console.log(`\x1b[33mPress Ctrl+C to stop.\x1b[0m`);
+
+    const CHECK_INTERVAL = 30;
+    let nextCheckTime = Date.now();
+    let checks = 0;
+
+    const statsShowInterval = 100; // Show stats every 100 checks
 
     while (true) {
-        for (const code of VANITY_CODES) {
-            const success = await tryClaim(token, code, true);
-            if (success) {
-                // If successful, pass the claimed code to Guard Mode
-                establishGatewayConnection(token, code);
-                return;
+        const now = Date.now();
+        if (now >= nextCheckTime) {
+            checks++;
+
+            for (const code of VANITY_CODES) {
+                // Check
+                const resp = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, null, {}, false);
+                let data = {};
+                try { data = JSON.parse(resp); } catch { }
+
+                if (data.code !== code) {
+                    console.log(`\x1b[31m[Aggressive] 🚨 ALERT! Vanity '${code}' is missing! (Current: ${data.code || "NONE"}) Claiming NOW...\x1b[0m`);
+                    const success = await tryClaim(token, code, true);
+                    if (success) {
+                        establishGatewayConnection(token, code);
+                        return;
+                    }
+                }
             }
-            // Small delay between codes
-            await new Promise(r => setTimeout(r, 250));
+
+            if (checks % statsShowInterval === 0) {
+                process.stdout.write(`\x1b[36m[Aggressive] Pulse: ${checks} cycles completed...\r\x1b[0m`);
+            }
+
+            nextCheckTime = now + CHECK_INTERVAL;
         }
-        // Delay between full cycles
-        await new Promise(r => setTimeout(r, 1000));
+
+        const sleepTime = Math.max(0, nextCheckTime - Date.now());
+        if (sleepTime > 0) {
+            await new Promise(r => setTimeout(r, sleepTime));
+        }
     }
+}
+
+async function modeScheduled() {
+    printConfig();
+    console.log(`\n\x1b[36m[Grace Tracker] ⏳ Prepare for a scheduled claim.\x1b[0m`);
+    console.log(`\x1b[33mExample Format: 2026-02-07 20:00:00 (Local Time)\x1b[0m`);
+
+    const askTarget = () => new Promise(resolve => rl.question("\nTarget Date/Time (YYYY-MM-DD HH:mm:ss): ", resolve));
+    let input = await askTarget();
+    let targetDate = new Date(input);
+
+    if (isNaN(targetDate.getTime())) {
+        console.log("\x1b[31mInvalid date format! Returning to menu...\x1b[0m");
+        rl.question("\nPress Enter...", () => showMenu());
+        return;
+    }
+
+    const targetTs = targetDate.getTime();
+    console.log(`\x1b[32mTarget Locked: ${targetDate.toLocaleString()}\x1b[0m`);
+
+    sendWebhook("🕒 Scheduled Snipe Active", `Monitoring until **${targetDate.toLocaleString()}** for **${VANITY_CODE}**`, 0x00FFFF);
+
+    const countdown = setInterval(() => {
+        const now = Date.now();
+        const diff = targetTs - now;
+
+        if (diff <= 0) {
+            clearInterval(countdown);
+            return;
+        }
+
+        if (diff > 10000) { // More than 10s left
+            const hours = Math.floor(diff / 3600000);
+            const mins = Math.floor((diff % 3600000) / 60000);
+            const secs = Math.floor((diff % 60000) / 1000);
+            process.stdout.write(`\x1b[36m[Countdown] T-Minus: ${hours}h ${mins}m ${secs}s ...     \r\x1b[0m`);
+        }
+    }, 1000);
+
+    // Main wait loop
+    while (true) {
+        const now = Date.now();
+        const diff = targetTs - now;
+
+        if (diff <= 10000) { // 10 seconds before target
+            clearInterval(countdown);
+            console.log(`\n\x1b[31m[Grace Tracker] 🚨 T-10 SECONDS! INITIATING BURST MODE NOW!\x1b[0m`);
+            sendWebhook("🚨 BURST MODE", "Scheduled target is 10 seconds away! Starting aggressive polling.", 0xFF0000);
+
+            // Switch to logic similar to modeAggressive but even more prioritized
+            const burstInterval = 25; // Even faster 25ms
+            let nextCheck = Date.now();
+            const token = await authenticateMfa();
+            if (!token) break;
+
+            while (Date.now() < targetTs + 5000) { // Run for 5s after target to be safe
+                if (Date.now() >= nextCheck) {
+                    for (const code of VANITY_CODES) {
+                        sendHttpRequest('PATCH', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, { code: code }, { 'X-Discord-MFA-Authorization': token }, false).then(resp => {
+                            if (resp.includes(`"${code}"`)) {
+                                console.log(`\x1b[32m!!! SUCCESS !!! SCHEDULED SNIPE VICTORY: ${code} !\x1b[0m`);
+                                process.exit(0);
+                            }
+                        });
+                    }
+                    nextCheck = Date.now() + burstInterval;
+                }
+                await new Promise(r => setTimeout(r, 5));
+            }
+            console.log("\n\x1b[33m[Grace Tracker] Target window passed. Returning to menu.\x1b[0m");
+            break;
+        }
+        await new Promise(r => setTimeout(r, 100)); // Sleep 100ms when far away
+    }
+    rl.question("\nPress Enter...", () => showMenu());
 }
 
 function establishGatewayConnection(mfaToken, activeCode) {
@@ -408,10 +526,21 @@ function establishGatewayConnection(mfaToken, activeCode) {
             } else if (packet.t === 'GUILD_UPDATE') {
                 const g = packet.d;
                 if (g.id === TARGET_GUILD_ID) {
-                    if (g.vanity_url_code !== activeCode && activeCode) {
+                    // If the current vanity is NOT in our target list, it might have dropped or changed
+                    // Or if we are specifically watching 'activeCode'
+                    if (activeCode && g.vanity_url_code !== activeCode) {
                         console.log(`\x1b[31m[Guard] 🚨 ALERT! URL Changed to '${g.vanity_url_code}'! RE-CLAIMING '${activeCode}' NOW!\x1b[0m`);
                         sendWebhook("🚨 GUARD TRIGGERED", `URL dropped to **${g.vanity_url_code}**. Re-claiming **${activeCode}** immediately!`, 0xFF0000, true);
                         await tryClaim(mfaToken, activeCode, true);
+                    } else if (!activeCode) {
+                        // If no specific code is being guarded, check if any of our codes are missing
+                        for (const code of VANITY_CODES) {
+                            if (g.vanity_url_code !== code) {
+                                // This is a bit complex because one of them will always not match if we have multiple
+                                // So Gateway mode with multiple URLs needs to be smart.
+                                // For now, let's just use the activeCode logic which is safer.
+                            }
+                        }
                     }
                 }
             } else if (packet.t === 'READY') {
@@ -438,11 +567,12 @@ function showMenu() {
     `);
     console.log("\x1b[36m1. Instant Snipe (Try to claim NOW)\x1b[0m");
     console.log("\x1b[36m2. Gateway Sniper (Listen for URL changes)\x1b[0m");
-    console.log("\x1b[36m3. Multi-Snipe Loop (Cycle through URLs)\x1b[0m");
-    console.log("\x1b[36m4. Configuration Check\x1b[0m");
-    console.log("\x1b[31m5. Exit\x1b[0m");
+    console.log("\x1b[36m3. Aggressive Mode (High Speed - 30ms)\x1b[0m");
+    console.log("\x1b[36m4. Grace Period Tracker (Scheduled Snipe)\x1b[0m");
+    console.log("\x1b[36m5. Configuration Check\x1b[0m");
+    console.log("\x1b[31m6. Exit\x1b[0m");
 
-    rl.question("\n\x1b[33mSelect Mode (1-5): \x1b[0m", handleMenu);
+    rl.question("\n\x1b[33mSelect Mode (1-6): \x1b[0m", handleMenu);
 }
 
 async function handleMenu(option) {
@@ -452,11 +582,13 @@ async function handleMenu(option) {
         console.log("Starting Gateway Sniper...");
         await modeGateway();
     } else if (option === '3') {
-        await modeLoop();
+        await modeAggressive();
     } else if (option === '4') {
+        await modeScheduled();
+    } else if (option === '5') {
         printConfig();
         rl.question("\nPress Enter to return...", () => showMenu());
-    } else if (option === '5') {
+    } else if (option === '6') {
         console.log("Exiting...");
         process.exit(0);
     } else {

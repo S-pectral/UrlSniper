@@ -1,6 +1,10 @@
 {
     "name": "discord-sniper",
     "version": "1.0.0",
+    "main": "advanced_sniper.js",
+    "scripts": {
+        "start": "node advanced_sniper.js"
+    },
     "type": "module",
     "dependencies": {
         "dotenv": "^16.4.7",
