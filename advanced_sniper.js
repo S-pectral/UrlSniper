@@ -1,8 +1,8 @@
 import WebSocket from 'ws';
 import tls from 'tls';
 import dotenv from 'dotenv';
-import fs from 'fs';
 import readline from 'readline';
+import { Buffer } from 'node:buffer';
 
 // Load config
 dotenv.config();
@@ -11,38 +11,316 @@ const USER_TOKEN = process.env.TOKEN;
 const TARGET_GUILD_ID = process.env.GUILD_ID;
 const USER_PASSWORD = process.env.PASSWORD;
 const VANITY_CODES = (process.env.VANITY_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-const VANITY_CODE = VANITY_CODES[0]; // Primary for backward compatibility/guard
+const VANITY_CODE = VANITY_CODES[0]; // Primary vanity for backward compatibility/guard
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
 let mfaAuthToken = null;
-let latestSequence = null;
-let heartbeatTimer = null;
-let tlsSocket = null;
-let rl = readline.createInterface({
+const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
 
 const printConfig = () => {
+    const vanityStr = VANITY_CODES.join(", ") || "MISSING";
+    const displayVanity = vanityStr.length > 36 ? vanityStr.substring(0, 33) + "..." : vanityStr;
+
     console.log(`
     \x1b[36m┌──────────────────────┬──────────────────────────────────────┐
     │ \x1b[1mCONFIGURATION\x1b[0m\x1b[36m        │ \x1b[1mSTATUS\x1b[0m\x1b[36m                               │
     ├──────────────────────┼──────────────────────────────────────┤
     │ Token                │ ${USER_TOKEN ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
     │ Guild ID             │ \x1b[33m${(TARGET_GUILD_ID || "MISSING").padEnd(36)}\x1b[36m │
-    │ Vanity URL(s)        │ \x1b[35m${(VANITY_CODES.join(", ") || "MISSING").padEnd(36)}\x1b[36m │
+    │ Vanity URL(s)        │ \x1b[35m${displayVanity.padEnd(36)}\x1b[36m │
     │ Password             │ ${USER_PASSWORD ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
     │ Webhook              │ ${WEBHOOK_URL ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
     └──────────────────────┴──────────────────────────────────────┘\x1b[0m`);
+
+    if (vanityStr.length > 36) {
+        console.log(`    \x1b[35m[Vanity List]\x1b[0m ${vanityStr}\n`);
+    }
 };
 
+// --- RAW TLS & HTTP/1.1 PARSER ---
+
 function createTlsSocket() {
-    return tls.connect({
+    const socket = tls.connect({
         host: 'canary.discord.com',
         port: 443,
         rejectUnauthorized: true,
         minVersion: 'TLSv1.2',
-        maxVersion: 'TLSv1.2'
+        maxVersion: 'TLSv1.3'
+    });
+    socket.setNoDelay(true);
+
+    // Keep permanent error handler so idle sockets never crash Node
+    socket.on('error', () => {
+        try { socket.destroy(); } catch { }
+    });
+
+    return socket;
+}
+
+function parseHttpResponse(rawBuffer, isSocketEnded = false) {
+    const headerSep = Buffer.from('\r\n\r\n');
+    const sepIndex = rawBuffer.indexOf(headerSep);
+    if (sepIndex === -1) {
+        return null;
+    }
+
+    const headerStr = rawBuffer.subarray(0, sepIndex).toString('utf-8');
+    const headerLines = headerStr.split('\r\n');
+    const statusLine = headerLines[0] || '';
+    const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})(?:\s+(.*))?$/);
+
+    if (!statusMatch) {
+        return { error: 'Invalid HTTP status line', raw: headerStr };
+    }
+
+    const statusCode = parseInt(statusMatch[1], 10);
+    const statusMessage = statusMatch[2] || '';
+    const headers = {};
+
+    for (let i = 1; i < headerLines.length; i++) {
+        const line = headerLines[i];
+        const colonIdx = line.indexOf(':');
+        if (colonIdx !== -1) {
+            const key = line.substring(0, colonIdx).trim().toLowerCase();
+            const val = line.substring(colonIdx + 1).trim();
+            headers[key] = val;
+        }
+    }
+
+    const bodyStart = sepIndex + 4;
+    const bodyBuffer = rawBuffer.subarray(bodyStart);
+
+    if (statusCode === 204 || statusCode === 304) {
+        return {
+            statusCode,
+            statusMessage,
+            headers,
+            body: '',
+            remainingBuffer: bodyBuffer
+        };
+    }
+
+    const isChunked = (headers['transfer-encoding'] || '').toLowerCase().includes('chunked');
+    const contentLength = headers['content-length'] ? parseInt(headers['content-length'], 10) : null;
+
+    if (isChunked) {
+        let offset = 0;
+        const chunkParts = [];
+
+        while (true) {
+            const crlfIdx = bodyBuffer.indexOf(Buffer.from('\r\n'), offset);
+            if (crlfIdx === -1) {
+                return null;
+            }
+
+            const sizeHex = bodyBuffer.subarray(offset, crlfIdx).toString('utf-8').trim();
+            const chunkSize = parseInt(sizeHex, 16);
+            if (isNaN(chunkSize)) {
+                return { error: 'Invalid chunk size: ' + sizeHex };
+            }
+
+            if (chunkSize === 0) {
+                const trailerIdx = bodyBuffer.indexOf(Buffer.from('\r\n'), crlfIdx + 2);
+                if (trailerIdx === -1 && bodyBuffer.length < crlfIdx + 4) {
+                    return null;
+                }
+                const finalOffset = (trailerIdx !== -1) ? trailerIdx + 2 : crlfIdx + 4;
+                const fullBody = Buffer.concat(chunkParts);
+                return {
+                    statusCode,
+                    statusMessage,
+                    headers,
+                    body: fullBody.toString('utf-8'),
+                    remainingBuffer: bodyBuffer.subarray(finalOffset)
+                };
+            }
+
+            const dataStart = crlfIdx + 2;
+            const dataEnd = dataStart + chunkSize;
+            if (bodyBuffer.length < dataEnd + 2) {
+                return null;
+            }
+
+            chunkParts.push(bodyBuffer.subarray(dataStart, dataEnd));
+            offset = dataEnd + 2;
+        }
+    } else if (contentLength !== null) {
+        if (bodyBuffer.length < contentLength) {
+            return null;
+        }
+        const fullBody = bodyBuffer.subarray(0, contentLength);
+        return {
+            statusCode,
+            statusMessage,
+            headers,
+            body: fullBody.toString('utf-8'),
+            remainingBuffer: bodyBuffer.subarray(contentLength)
+        };
+    } else if (isSocketEnded) {
+        return {
+            statusCode,
+            statusMessage,
+            headers,
+            body: bodyBuffer.toString('utf-8'),
+            remainingBuffer: Buffer.alloc(0)
+        };
+    }
+
+    return null;
+}
+
+// HTTP Connection Manager
+let sharedKeepAliveSocket = null;
+let sharedSocketBusy = false;
+
+async function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false, attempt = 1, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+        const payload = body ? JSON.stringify(body) : '';
+        let socket;
+        let isShared = false;
+
+        if (!closeConnection) {
+            if (sharedKeepAliveSocket && !sharedKeepAliveSocket.destroyed && !sharedSocketBusy) {
+                socket = sharedKeepAliveSocket;
+                sharedSocketBusy = true;
+                isShared = true;
+            } else if (!sharedSocketBusy) {
+                sharedKeepAliveSocket = createTlsSocket();
+                socket = sharedKeepAliveSocket;
+                sharedSocketBusy = true;
+                isShared = true;
+            } else {
+                // Shared socket is busy handling another in-flight request: create dedicated socket
+                socket = createTlsSocket();
+                isShared = false;
+            }
+        } else {
+            socket = createTlsSocket();
+            isShared = false;
+        }
+
+        const headers = [
+            `${method} ${path} HTTP/1.1`,
+            'Host: canary.discord.com',
+            `Connection: ${closeConnection ? 'close' : 'keep-alive'}`,
+            'Content-Type: application/json',
+            `Content-Length: ${Buffer.byteLength(payload)}`,
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+            `Authorization: ${USER_TOKEN}`,
+            'X-Super-Properties: eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRmlyZWZveCIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJ0ci1UUiIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQ7IHJ2OjEzMy4wKSBHZWNrby8yMDEwMDEwMSBGaXJlZm94LzEzMy4wIiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTMzLjAiLCJvc192ZXJzaW9uIjoiMTAiLCJyZWZlcnJlciI6Imh0dHBzOi8vd3d3Lmdvb2dsZS5jb20vIiwicmVmZXJyaW5nX2RvbWFpbiI6Ind3dy5nb29nbGUuY29tIiwic2VhcmNoX2VuZ2luZSI6Imdvb2dsZSIsInJlZmVycmVyX2N1cnJlbnQiOiIiLCJyZWZlcnJpbmdfZG9tYWluX2N1cnJlbnQiOiIiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfYnVpbGRfbnVtYmVyIjozNTYxNDAsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImhhc19jbGllbnRfbW9kcyI6ZmFsc2V9'
+        ];
+
+        if (extraHeaders['X-Discord-MFA-Authorization']) {
+            headers.push(`X-Discord-MFA-Authorization: ${extraHeaders['X-Discord-MFA-Authorization']}`);
+        }
+
+        headers.push('', payload);
+
+        let recvBuffer = socket._residualBuffer || Buffer.alloc(0);
+        socket._residualBuffer = Buffer.alloc(0);
+
+        let isCompleted = false;
+
+        const cleanupAndFinish = (responseObj) => {
+            if (isCompleted) return;
+            isCompleted = true;
+            clearTimeout(timeoutId);
+
+            socket.removeListener('data', onData);
+            socket.removeListener('end', onEnd);
+            socket.removeListener('error', onError);
+
+            if (isShared) {
+                sharedSocketBusy = false;
+                if (closeConnection || (responseObj?.headers && responseObj.headers['connection'] === 'close')) {
+                    try { socket.destroy(); } catch { }
+                    sharedKeepAliveSocket = null;
+                }
+            } else {
+                try { socket.destroy(); } catch { }
+            }
+
+            let parsedJson = null;
+            if (responseObj?.body) {
+                try { parsedJson = JSON.parse(responseObj.body); } catch { }
+            }
+
+            resolve({
+                statusCode: responseObj?.statusCode || 0,
+                statusMessage: responseObj?.statusMessage || '',
+                headers: responseObj?.headers || {},
+                body: responseObj?.body || '',
+                json: parsedJson,
+                ok: (responseObj?.statusCode >= 200 && responseObj?.statusCode < 300)
+            });
+        };
+
+        const timeoutId = setTimeout(() => {
+            if (isCompleted) return;
+            try { socket.destroy(); } catch { }
+            if (isShared) {
+                sharedSocketBusy = false;
+                sharedKeepAliveSocket = null;
+            }
+
+            if (attempt <= 3) {
+                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1, timeoutMs));
+            } else {
+                cleanupAndFinish({ statusCode: 408, statusMessage: 'Request Timeout', body: '' });
+            }
+        }, timeoutMs);
+
+        const onData = (chunk) => {
+            recvBuffer = Buffer.concat([recvBuffer, chunk]);
+            const parsed = parseHttpResponse(recvBuffer, false);
+            if (parsed) {
+                if (parsed.error) {
+                    cleanupAndFinish({ statusCode: 500, statusMessage: parsed.error, body: '' });
+                } else {
+                    socket._residualBuffer = parsed.remainingBuffer;
+                    cleanupAndFinish(parsed);
+                }
+            }
+        };
+
+        const onEnd = () => {
+            const parsed = parseHttpResponse(recvBuffer, true);
+            cleanupAndFinish(parsed || { statusCode: 0, statusMessage: 'Connection Closed', body: '' });
+        };
+
+        const onError = (err) => {
+            if (isCompleted) return;
+            try { socket.destroy(); } catch { }
+            if (isShared) {
+                sharedSocketBusy = false;
+                sharedKeepAliveSocket = null;
+            }
+
+            if (attempt <= 3) {
+                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1, timeoutMs));
+            } else {
+                cleanupAndFinish({ statusCode: 500, statusMessage: err.message, body: '' });
+            }
+        };
+
+        socket.on('data', onData);
+        socket.once('end', onEnd);
+        socket.once('error', onError);
+
+        // Immediate check if residualBuffer already contained complete response
+        if (recvBuffer.length > 0) {
+            const initialCheck = parseHttpResponse(recvBuffer, false);
+            if (initialCheck && !initialCheck.error) {
+                socket._residualBuffer = initialCheck.remainingBuffer;
+                cleanupAndFinish(initialCheck);
+                return;
+            }
+        }
+
+        socket.write(headers.join('\r\n'));
     });
 }
 
@@ -63,7 +341,9 @@ async function sendWebhook(title, description, color = 0x00FF00, mentionEveryone
         embeds: [embed]
     };
 
-    // if (mentionEveryone) payload.content = "@everyone";
+    if (mentionEveryone) {
+        payload.content = "@everyone";
+    }
 
     try {
         await fetch(WEBHOOK_URL, {
@@ -76,212 +356,134 @@ async function sendWebhook(title, description, color = 0x00FF00, mentionEveryone
     }
 }
 
-// Retries wrapper for sendHttpRequest
-async function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false, attempt = 1) {
-    return new Promise((resolve) => {
-        const payload = body ? JSON.stringify(body) : '';
+// --- MFA UTILS ---
 
-        // If retrying, force a fresh socket
-        if (attempt > 1 && tlsSocket) {
-            try { tlsSocket.destroy(); } catch { }
-            tlsSocket = null;
-        }
+async function solveMfaChallenge(ticket) {
+    if (!USER_PASSWORD) {
+        console.log("\x1b[31m[MFA] ❌ Cannot solve MFA: PASSWORD is not set in .env!\x1b[0m");
+        return null;
+    }
 
-        if (!tlsSocket || tlsSocket.destroyed || closeConnection) {
-            tlsSocket = createTlsSocket();
-            tlsSocket.setNoDelay(true);
-        }
-        const socket = tlsSocket;
+    console.log("\x1b[33m[MFA] 🔒 Two-Factor Auth Challenge detected. Auto-solving with account password...\x1b[0m");
+    const finishRes = await sendHttpRequest('POST', '/api/v9/mfa/finish', {
+        ticket: ticket,
+        mfa_type: 'password',
+        data: USER_PASSWORD
+    }, {}, true);
 
-        const headers = [
-            `${method} ${path} HTTP/1.1`,
-            'Host: canary.discord.com',
-            `Connection: ${closeConnection ? 'close' : 'keep-alive'}`,
-            'Content-Type: application/json',
-            `Content-Length: ${Buffer.byteLength(payload)}`,
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
-            `Authorization: ${USER_TOKEN}`,
-            'X-Super-Properties: eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRmlyZWZveCIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJ0ci1UUiIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQ7IHJ2OjEzMy4wKSBHZWNrby8yMDEwMDEwMSBGaXJlZm94LzEzMy4wIiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTMzLjAiLCJvc192ZXJzaW9uIjoiMTAiLCJyZWZlcnJlciI6Imh0dHBzOi8vd3d3Lmdvb2dsZS5jb20vIiwicmVmZXJyaW5nX2RvbWFpbiI6Ind3dy5nb29nbGUuY29tIiwic2VhcmNoX2VuZ2luZSI6Imdvb2dsZSIsInJlZmVycmVyX2N1cnJlbnQiOiIiLCJyZWZlcnJpbmdfZG9tYWluX2N1cnJlbnQiOiIiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfYnVpbGRfbnVtYmVyIjozNTYxNDAsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImhhc19jbGllbnRfbW9kcyI6ZmFsc2V9'
-        ];
-
-        if (extraHeaders['X-Discord-MFA-Authorization']) {
-            headers.push(`X-Discord-MFA-Authorization: ${extraHeaders['X-Discord-MFA-Authorization']}`);
-        }
-
-        headers.push('', payload);
-
-        let responseData = '';
-
-        // Handle socket errors specifically
-        const errorHandler = (err) => {
-            // console.log("Socket Error:", err);
-            // On error, if we haven't retried too many times, try again
-            socket.removeListener('data', dataHandler);
-            socket.removeListener('end', endHandler);
-
-            if (attempt <= 3) {
-                // console.log(`[Network] Retrying request (Attempt ${attempt + 1})...`);
-                // Recursively call self with clean socket
-                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1));
-            } else {
-                resolve('{}');
-            }
-        };
-
-        const dataHandler = (chunk) => { responseData += chunk.toString(); };
-
-        const endHandler = () => {
-            try {
-                const separatorIndex = responseData.indexOf('\r\n\r\n');
-                if (separatorIndex === -1) return resolve('{}');
-                let bodyRaw = responseData.slice(separatorIndex + 4);
-
-                const firstTrace = bodyRaw.indexOf('{');
-                const lastTrace = bodyRaw.lastIndexOf('}');
-
-                if (firstTrace !== -1 && lastTrace !== -1 && lastTrace > firstTrace) {
-                    resolve(bodyRaw.substring(firstTrace, lastTrace + 1));
-                } else {
-                    resolve('{}');
-                }
-            } catch (e) {
-                resolve('{}');
-            } finally {
-                if (closeConnection) socket.destroy();
-                // Clean up listeners
-                socket.removeListener('error', errorHandler);
-                socket.removeListener('data', dataHandler);
-            }
-        };
-
-        socket.once('error', errorHandler);
-        socket.on('data', dataHandler);
-        socket.once('end', endHandler);
-
-        socket.write(headers.join('\r\n'));
-    });
+    if (finishRes.json?.token) {
+        console.log('\x1b[32m[MFA] 🔓 MFA TOKEN OBTAINED SUCCESSFULLY!\x1b[0m');
+        mfaAuthToken = finishRes.json.token;
+        await sendWebhook("MFA Security Solved", "Successfully solved 2FA challenge and obtained authorization token.", 0x00FF00);
+        return finishRes.json.token;
+    } else {
+        const errMsg = finishRes.json?.message || finishRes.statusMessage || 'Unknown error';
+        console.log(`\x1b[31m[MFA] ❌ Failed to get MFA Token: ${errMsg} (Code: ${finishRes.json?.code})\x1b[0m`);
+        await sendWebhook("MFA Failed", `Failed to solve MFA challenge.\nError: ${errMsg}`, 0xFF0000);
+        return null;
+    }
 }
-
-// --- CORE UTILS ---
 
 async function authenticateMfa() {
     console.log("\x1b[36m[MFA] 🛡️ Checking Security Requirements...\x1b[0m");
+    if (!USER_PASSWORD) {
+        console.log("\x1b[33m[MFA] ⚠️ No PASSWORD provided in .env. Skipping pre-authentication.\x1b[0m");
+        return null;
+    }
+
     try {
-        const patchResp = await sendHttpRequest('PATCH', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, { code: VANITY_CODE }, {}, true);
+        const patchRes = await sendHttpRequest('PATCH', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, { code: VANITY_CODE }, {}, true);
+        const patchData = patchRes.json || {};
 
-        let patchData = {};
-        try { patchData = JSON.parse(patchResp); } catch { }
-
-        if (patchData.code === 60003) {
+        if (patchData.code === 60003 && patchData.mfa?.ticket) {
             console.log("\x1b[33m[MFA] 🔒 Two-Factor Auth Required (Code 60003). Auto-Solving...\x1b[0m");
-            const finishResp = await sendHttpRequest('POST', '/api/v9/mfa/finish', {
-                ticket: patchData.mfa.ticket,
-                mfa_type: 'password',
-                data: USER_PASSWORD
-            }, {}, true);
-
-            let finishData = {};
-            try { finishData = JSON.parse(finishResp); } catch { }
-
-            if (finishData.token) {
-                console.log('\x1b[32m[MFA] 🔓 MFA TOKEN OBTAINED SUCCESSFULLY!\x1b[0m');
-                sendWebhook("MFA Security Bypassed", "Successfully solved 2FA challenge and obtained authorization token.", 0x00FF00);
-                return finishData.token;
-            } else {
-                console.log("\x1b[31m[MFA] ❌ Failed to get MFA Token.\x1b[0m");
-                sendWebhook("MFA Failed", `Failed to solve MFA challenge.\nError: ${finishData.message}`, 0xFF0000);
-                if (finishData.message) console.log(`\x1b[31m[Error] ${finishData.message} (Code: ${finishData.code})\x1b[0m`);
-            }
-        } else if (patchData.code === VANITY_CODE || patchData.code === 200) {
-            console.log("\x1b[32m!!! STATUS !!! Vanity status check successful.\x1b[0m");
-            return "CHECK_COMPLETE";
+            return await solveMfaChallenge(patchData.mfa.ticket);
+        } else if (patchRes.statusCode === 200 && (patchData.code === VANITY_CODE || patchData.vanity_url_code === VANITY_CODE)) {
+            console.log(`\x1b[32m!!! VICTORY !!! Vanity '${VANITY_CODE}' claimed during initial verification!\x1b[0m`);
+            await sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${VANITY_CODE}\n**Guild:** ${TARGET_GUILD_ID}`, 0x00FF00, true);
+            return "ALREADY_CLAIMED";
         } else {
-            // let tryClaim handle it
+            console.log(`\x1b[32m[MFA] ✅ Pre-check complete (HTTP ${patchRes.statusCode}). Ready.\x1b[0m`);
+            return null;
         }
     } catch (e) {
-        console.log("MFA Auth Error:", e);
+        console.log(`\x1b[31m[MFA] Auth verification error: ${e.message}\x1b[0m`);
+        return null;
     }
-    return null;
 }
 
-async function tryClaim(mfaToken, code = VANITY_CODE, keepAlive = false) {
-    if (!mfaToken) {
-        console.log("\x1b[31m[Claim] Cannot claim without MFA Token!\x1b[0m");
-        return false;
-    }
+// --- CLAIM LOGIC ---
 
-    // Slight Optimization: Special flag for "Check Complete"
-    if (mfaToken === "CHECK_COMPLETE") {
-        return false; // Just used for auth check
-    }
+async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) {
+    if (!code) return false;
 
     console.log(`\x1b[36m[Sniper] 🔫 Attempting to claim '${code}'...\x1b[0m`);
 
-    // STRATEGY 1: Specific Endpoint
-    let resp = await sendHttpRequest(
+    const headers = {};
+    if (mfaAuthToken) {
+        headers['X-Discord-MFA-Authorization'] = mfaAuthToken;
+    }
+
+    const res = await sendHttpRequest(
         'PATCH',
         `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`,
         { code: code },
-        { 'X-Discord-MFA-Authorization': mfaToken },
+        headers,
         true
     );
 
-    let result = {};
-    try { result = JSON.parse(resp); } catch { }
+    const result = res.json || {};
 
-    // Fallback if 10008 (Unknown Message) or 404
-    if (result.code === 10008 || result.code === 404) {
-        console.log(`\x1b[33m[Sniper] Endpoint Error (${result.code}). Trying Fallback (Generic Guild Patch)...\x1b[0m`);
-        resp = await sendHttpRequest(
-            'PATCH',
-            `/api/v9/guilds/${TARGET_GUILD_ID}`,
-            // Send both common keys to be sure
-            { code: code, vanity_code: code },
-            { 'X-Discord-MFA-Authorization': mfaToken },
-            true
-        );
-        try { result = JSON.parse(resp); } catch { }
+    // 1. Handle MFA challenge (code 60003) - refresh expired or missing MFA token
+    if (result.code === 60003 && result.mfa?.ticket) {
+        if (isRetry) {
+            console.log("\x1b[31m[MFA] ❌ Code 60003 returned again after solving MFA.\x1b[0m");
+            return false;
+        }
+        console.log("\x1b[33m[Sniper] ⚠️ MFA required or token expired (Code 60003). Auto-solving now...\x1b[0m");
+        const freshToken = await solveMfaChallenge(result.mfa.ticket);
+        if (freshToken) {
+            return await tryClaim(code, keepAlive, true);
+        }
+        return false;
     }
 
-    // Check success
-    const validKeys = ["vanity_url_code", "code", "vanity_code"];
-    const isSuccess = validKeys.some(key => result[key] === code);
+    // 2. Handle 429 Rate Limit
+    if (res.statusCode === 429) {
+        const retryAfter = result.retry_after || parseFloat(res.headers['retry-after']) || 2;
+        console.log(`\x1b[31m[Sniper] ⛔ Rate Limited (429)! Cooldown: ${retryAfter}s\x1b[0m`);
+        await new Promise(r => setTimeout(r, Math.ceil(retryAfter * 1000)));
+        return false;
+    }
 
-    // Also check raw string matching just in case
-    const rawSuccess = resp.includes(`"${code}"`) && !resp.includes("errors");
+    // 3. Check Success strictly
+    const isSuccess = res.statusCode === 200 && (result.code === code || result.vanity_url_code === code);
 
-    if (isSuccess || rawSuccess) {
+    if (isSuccess) {
         console.log(`\x1b[32m!!! VICTORY !!! URL '${code}' SNIPED SUCCESSFULLY !\x1b[0m`);
-        sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${code}\n**Guild:** ${TARGET_GUILD_ID}`, 0x00FF00, true);
+        await sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${code}\n**Guild:** ${TARGET_GUILD_ID}`, 0x00FF00, true);
 
         if (keepAlive) {
-            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. I will watch this server and re-claim if the URL drops.\x1b[0m");
-            sendWebhook("🛡️ Guard Mode Active", `Watching for changes to **${code}**...`, 0x0000FF);
-            return true;
-        } else {
-            return true;
+            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. Watching this server to re-claim if the URL drops.\x1b[0m");
+            await sendWebhook("🛡️ Guard Mode Active", `Watching for changes to **${code}**...`, 0x0000FF);
         }
-    } else {
-        if (result.code === 50013) {
-            console.log("\x1b[31m[Sniper] ⛔ PERMISSION DENIED (50013)\x1b[0m");
-            sendWebhook("⛔ Permission Denied", "Code 50013: Missing 'Manage Server' permission.", 0xFF0000);
-            console.log("\x1b[33m👉 Check Account Permissions! (Need 'Manage Server')\x1b[0m");
-        } else if (result.code === 10008) {
-            console.log("\x1b[31m[Sniper] ⛔ UNKNOWN MESSAGE (10008) - BOTH ENDPOINTS FAILED.\x1b[0m");
-            console.log("\x1b[33m👉 Check if Guild still exists and you are in it.\x1b[0m");
-        } else if (result.code) {
-            console.log(`\x1b[31m[Sniper] ❌ Failed: ${result.message} (Code: ${result.code})\x1b[0m`);
-        } else {
-            // If we got the guild object back but code didn't change:
-            if (result.id === TARGET_GUILD_ID) {
-                console.log(`\x1b[31m[Sniper] ❌ Server accepted request but didn't update URL.\x1b[0m`);
-                console.log(`\x1b[33mCurrent URL: ${result.vanity_url_code}\x1b[0m`);
-                sendWebhook("❌ Claim Failed", `Server returned 200 OK but URL is still **${result.vanity_url_code}**.\nPossible Rate Limit or Taken.`, 0xFFA500);
-            } else {
-                console.log(`[Sniper] Response: ${resp}`);
-            }
-        }
+        return true;
     }
+
+    // 4. Detailed error diagnosis
+    if (result.code === 50013) {
+        console.log("\x1b[31m[Sniper] ⛔ PERMISSION DENIED (50013): Missing 'Manage Server' permission.\x1b[0m");
+        await sendWebhook("⛔ Permission Denied", "Code 50013: Missing 'Manage Server' permission.", 0xFF0000);
+    } else if (result.code === 50020) {
+        console.log(`\x1b[33m[Sniper] ⚠️ Vanity '${code}' is already taken (Code: 50020).\x1b[0m`);
+    } else if (result.code === 50035) {
+        console.log(`\x1b[31m[Sniper] ⚠️ Invalid vanity code '${code}' (Code: 50035).\x1b[0m`);
+    } else if (result.code) {
+        console.log(`\x1b[31m[Sniper] ❌ Failed: ${result.message} (Code: ${result.code})\x1b[0m`);
+    } else {
+        console.log(`\x1b[31m[Sniper] ❌ Server returned HTTP ${res.statusCode}: ${res.body || res.statusMessage}\x1b[0m`);
+    }
+
     return false;
 }
 
@@ -289,29 +491,260 @@ async function tryClaim(mfaToken, code = VANITY_CODE, keepAlive = false) {
 
 async function verifyGuild() {
     console.log(`\x1b[36m[Check] Verifying Guild ID: ${TARGET_GUILD_ID}...\x1b[0m`);
-    const resp = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}`, null, {}, true);
+    const res = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}`, null, {}, true);
 
-    let data = {};
-    try { data = JSON.parse(resp); } catch { }
+    const data = res.json || {};
 
-    if (data.id === TARGET_GUILD_ID) {
+    if (res.statusCode === 200 && data.id === TARGET_GUILD_ID) {
         console.log(`\x1b[32m[Check] ✅ Guild Found: "${data.name}" (Owner ID: ${data.owner_id})\x1b[0m`);
         return true;
     } else {
-        console.log(`\x1b[31m[Check] ❌ Guild Check Failed!\x1b[0m`);
-        console.log(`\x1b[31mResponse: ${resp}\x1b[0m`);
-
+        console.log(`\x1b[31m[Check] ❌ Guild Check Failed! (Status: ${res.statusCode})\x1b[0m`);
         if (data.code === 10004) console.log("\x1b[33m👉 Diagnosis: UNKNOWN GUILD. The ID is wrong or you are not in the server.\x1b[0m");
         if (data.code === 10008) console.log("\x1b[33m👉 Diagnosis: UNKNOWN MESSAGE. You likely copied a Message ID, not the Server ID!\x1b[0m");
-        sendWebhook("⚠️ Config Error", "Guild Verification Failed. Check ID.", 0xFF0000);
+        await sendWebhook("⚠️ Config Error", "Guild Verification Failed. Check ID.", 0xFF0000);
         return false;
     }
 }
 
+// --- GATEWAY MANAGER ---
+
+class GatewayManager {
+    constructor() {
+        this.ws = null;
+        this.heartbeatTimer = null;
+        this.heartbeatAcked = true;
+        this.sessionId = null;
+        this.resumeGatewayUrl = null;
+        this.latestSequence = null;
+        this.activeCode = null;
+        this.isReconnecting = false;
+        this.shouldReconnect = true;
+        this.guildVanities = new Map(); // Tracks known vanities across all mutual guilds
+    }
+
+    start(codeToGuard) {
+        this.activeCode = codeToGuard || VANITY_CODE;
+        this.shouldReconnect = true;
+
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            console.log(`\x1b[35m[Gateway] Active connection updated to guard/snipe: '${this.activeCode}'\x1b[0m`);
+            return;
+        }
+
+        this.connect();
+    }
+
+    connect() {
+        this.clearHeartbeat();
+        const endpoint = (this.resumeGatewayUrl && this.sessionId)
+            ? `${this.resumeGatewayUrl}/?v=9&encoding=json`
+            : 'wss://gateway.discord.gg/?v=9&encoding=json';
+
+        this.ws = new WebSocket(endpoint);
+
+        // Crucial: ws.on('error') prevents process crash on network glitches
+        this.ws.on('error', (err) => {
+            console.log(`\x1b[31m[Gateway] Network Error: ${err.message}\x1b[0m`);
+        });
+
+        this.ws.on('open', () => {
+            console.log("\x1b[36m[Gateway] Connected to Discord Gateway.\x1b[0m");
+            sendWebhook("📡 Gateway Connected", "Listening for GUILD_UPDATE events...", 0x00FFFF);
+
+            if (this.sessionId && this.latestSequence !== null) {
+                // OP 6: Resume
+                console.log(`\x1b[36m[Gateway] Attempting to Resume session (seq: ${this.latestSequence})...\x1b[0m`);
+                this.sendPacket({
+                    op: 6,
+                    d: {
+                        token: USER_TOKEN,
+                        session_id: this.sessionId,
+                        seq: this.latestSequence
+                    }
+                });
+            } else {
+                // OP 2: Identify
+                this.sendPacket({
+                    op: 2,
+                    d: {
+                        token: USER_TOKEN,
+                        intents: 1,
+                        properties: { $os: 'Windows', $browser: 'Firefox', $device: '' }
+                    }
+                });
+            }
+        });
+
+        this.ws.on('message', async (data) => {
+            try {
+                const packet = JSON.parse(data);
+                if (packet.s !== null && packet.s !== undefined) {
+                    this.latestSequence = packet.s;
+                }
+
+                // OP 10: Hello
+                if (packet.op === 10) {
+                    const interval = packet.d.heartbeat_interval;
+                    this.heartbeatAcked = true;
+                    this.clearHeartbeat();
+
+                    // Initial jitter
+                    const jitter = Math.floor(interval * Math.random());
+                    setTimeout(() => {
+                        this.sendHeartbeat();
+                        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), interval);
+                    }, jitter);
+                }
+                // OP 11: Heartbeat ACK
+                else if (packet.op === 11) {
+                    this.heartbeatAcked = true;
+                }
+                // OP 7: Reconnect
+                else if (packet.op === 7) {
+                    console.log("\x1b[33m[Gateway] Server requested reconnect (OP 7). Reconnecting...\x1b[0m");
+                    this.reconnect(true);
+                }
+                // OP 9: Invalid Session
+                else if (packet.op === 9) {
+                    const canResume = packet.d === true;
+                    console.log(`\x1b[33m[Gateway] Invalid Session (OP 9). Resumable: ${canResume}\x1b[0m`);
+                    if (!canResume) {
+                        this.sessionId = null;
+                        this.latestSequence = null;
+                    }
+                    this.reconnect(canResume);
+                }
+                // Dispatch events (OP 0)
+                else if (packet.op === 0) {
+                    if (packet.t === 'READY') {
+                        this.sessionId = packet.d.session_id;
+                        if (packet.d.resume_gateway_url) {
+                            this.resumeGatewayUrl = packet.d.resume_gateway_url;
+                        }
+                        console.log(`\x1b[32m[Gateway] Ready! Logged in as ${packet.d.user.username}\x1b[0m`);
+
+                        // Cache initial vanity states for all mutual guilds
+                        if (Array.isArray(packet.d.guilds)) {
+                            for (const g of packet.d.guilds) {
+                                if (g.id && g.vanity_url_code) {
+                                    this.guildVanities.set(g.id, g.vanity_url_code);
+                                }
+                            }
+                        }
+                    } else if (packet.t === 'RESUMED') {
+                        console.log("\x1b[32m[Gateway] Session resumed successfully.\x1b[0m");
+                    } else if (packet.t === 'GUILD_CREATE') {
+                        const g = packet.d;
+                        if (g.id && g.vanity_url_code) {
+                            this.guildVanities.set(g.id, g.vanity_url_code);
+                        }
+                    } else if (packet.t === 'GUILD_UPDATE') {
+                        const guild = packet.d;
+                        const previousVanity = this.guildVanities.get(guild.id);
+                        const currentVanity = guild.vanity_url_code;
+                        this.guildVanities.set(guild.id, currentVanity);
+
+                        // CASE 1: Guarding TARGET_GUILD_ID (Your own server)
+                        if (guild.id === TARGET_GUILD_ID) {
+                            if (this.activeCode && currentVanity !== this.activeCode) {
+                                console.log(`\x1b[31m[Guard] 🚨 ALERT! Own server URL dropped/changed to '${currentVanity || "NONE"}'! RE-CLAIMING '${this.activeCode}' NOW!\x1b[0m`);
+                                await sendWebhook("🚨 GUARD TRIGGERED", `URL dropped to **${currentVanity || "NONE"}**. Re-claiming **${this.activeCode}** immediately!`, 0xFF0000, true);
+                                await tryClaim(this.activeCode, true);
+                            }
+                        }
+                        // CASE 2: External Guild dropped one of our target vanities!
+                        else {
+                            for (const targetCode of VANITY_CODES) {
+                                // If this guild previously had our target code and now dropped or changed it
+                                const hadTarget = (previousVanity === targetCode);
+                                const lostTarget = (currentVanity !== targetCode);
+
+                                if (hadTarget && lostTarget) {
+                                    console.log(`\x1b[32m[Gateway Snipe] 🎯 EXTERNAL DROP DETECTED! Guild '${guild.name}' dropped '${targetCode}'! SNIPING NOW...\x1b[0m`);
+                                    await sendWebhook("🎯 EXTERNAL DROP DETECTED", `Guild **${guild.name}** dropped **${targetCode}**! Claiming immediately!`, 0x00FF00, true);
+                                    const success = await tryClaim(targetCode, true);
+                                    if (success) {
+                                        this.activeCode = targetCode;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.log(`\x1b[31m[Gateway] Message Parse Error: ${err.message}\x1b[0m`);
+            }
+        });
+
+        this.ws.on('close', (code, reason) => {
+            this.clearHeartbeat();
+            if (!this.shouldReconnect) return;
+
+            console.log(`\x1b[33m[Gateway] Connection closed (${code}: ${reason || 'No reason'}). Reconnecting in 3s...\x1b[0m`);
+            setTimeout(() => {
+                if (this.shouldReconnect) this.connect();
+            }, 3000);
+        });
+    }
+
+    sendPacket(obj) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(obj));
+        }
+    }
+
+    sendHeartbeat() {
+        if (!this.heartbeatAcked) {
+            console.log("\x1b[31m[Gateway] Heartbeat ACK missed! Connection zombied. Reconnecting...\x1b[0m");
+            this.reconnect(true);
+            return;
+        }
+
+        this.heartbeatAcked = false;
+        this.sendPacket({ op: 1, d: this.latestSequence });
+    }
+
+    clearHeartbeat() {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+    }
+
+    reconnect(attemptResume = true) {
+        if (!attemptResume) {
+            this.sessionId = null;
+            this.latestSequence = null;
+        }
+        this.clearHeartbeat();
+        if (this.ws) {
+            try { this.ws.terminate(); } catch { }
+            this.ws = null;
+        }
+    }
+
+    setActiveCode(code) {
+        this.activeCode = code;
+    }
+
+    stop() {
+        this.shouldReconnect = false;
+        this.clearHeartbeat();
+        if (this.ws) {
+            try { this.ws.close(); } catch { }
+            this.ws = null;
+        }
+    }
+}
+
+const gateway = new GatewayManager();
+
 // --- MODES ---
 
 async function modeInstant() {
-    sendWebhook("🚀 Sniper Started", "Mode: Instant Snipe", 0xFFFF00);
+    await sendWebhook("🚀 Sniper Started", "Mode: Instant Snipe", 0xFFFF00);
     const guildOK = await verifyGuild();
     if (!guildOK) {
         console.log("Aborting Snipe due to invalid Guild ID.");
@@ -319,97 +752,125 @@ async function modeInstant() {
         return;
     }
 
-    const token = await authenticateMfa();
-    if (token && token !== "CHECK_COMPLETE") {
-        console.log(`\x1b[36m[Instant] 🔄 Checking list: ${VANITY_CODES.join(', ')}\x1b[0m`);
-        for (const code of VANITY_CODES) {
-            const success = await tryClaim(token, code, false);
-            if (success) process.exit(0);
-            await new Promise(r => setTimeout(r, 200));
-        }
-        rl.question("\nFinished checklist. Press Enter to return...", () => showMenu());
-    } else {
-        rl.question("\nAuth failed or no action needed. Press Enter...", () => showMenu());
+    const authResult = await authenticateMfa();
+    if (authResult === "ALREADY_CLAIMED") {
+        rl.question("\nVanity already secured on guild! Press Enter to return...", () => showMenu());
+        return;
     }
+
+    console.log(`\x1b[36m[Instant] 🔄 Checking list: ${VANITY_CODES.join(', ')}\x1b[0m`);
+    for (const code of VANITY_CODES) {
+        const success = await tryClaim(code, false);
+        if (success) {
+            console.log("\x1b[32mClaim completed successfully! Exiting...\x1b[0m");
+            await new Promise(r => setTimeout(r, 1000));
+            process.exit(0);
+        }
+        await new Promise(r => setTimeout(r, 200));
+    }
+    rl.question("\nFinished checklist. Press Enter to return...", () => showMenu());
 }
 
 async function modeGateway() {
-    sendWebhook("🚀 Sniper Started", "Mode: Gateway Sniper (Guard Active)", 0xFFFF00);
-    const guildOK = await verifyGuild();
-    if (!guildOK) return;
-
-    const token = await authenticateMfa();
-    if (!token || token === "CHECK_COMPLETE") {
-        // Even if direct check failed, we might want to start listening
-        // but we need a real MFA token for re-claiming if it drops.
-        // If we don't have it, we should probably warn.
-        if (token === "CHECK_COMPLETE") {
-            console.log("\x1b[33m[Gateway] Note: Using Gateway without persistent MFA token might fail re-claims.\x1b[0m");
-        } else return;
-    }
-
-    console.log(`\x1b[36m[Gateway] � Monitoring for: ${VANITY_CODES.join(', ')}\x1b[0m`);
-
-    // Initial attempt for all
-    for (const code of VANITY_CODES) {
-        const success = await tryClaim(token, code, true);
-        if (success) {
-            establishGatewayConnection(token, code);
-            return;
-        }
-    }
-
-    // Default to watching the primary if none claimed yet
-    establishGatewayConnection(token, VANITY_CODE);
-}
-
-
-async function modeAggressive() {
-    sendWebhook("🚀 Sniper Started", "Mode: Aggressive Mode (High Speed)", 0xFFFF00);
+    await sendWebhook("🚀 Sniper Started", "Mode: Gateway Sniper (Guard Active)", 0xFFFF00);
     const guildOK = await verifyGuild();
     if (!guildOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
         return;
     }
 
-    const token = await authenticateMfa();
-    if (!token) return;
+    const authResult = await authenticateMfa();
+    if (authResult === "ALREADY_CLAIMED") {
+        console.log(`\x1b[35m[Gateway] 🛡️ Vanity '${VANITY_CODE}' is already claimed! Starting Guard.\x1b[0m`);
+        gateway.start(VANITY_CODE);
+        return;
+    }
 
-    // Connect Gateway as backup/alert
-    establishGatewayConnection(token, VANITY_CODE);
+    console.log(`\x1b[36m[Gateway] 📡 Monitoring for: ${VANITY_CODES.join(', ')}\x1b[0m`);
 
-    console.log(`\x1b[36m[Aggressive] 🚀 STARTING ULTRA 30ms MONITORING\x1b[0m`);
+    for (const code of VANITY_CODES) {
+        const success = await tryClaim(code, true);
+        if (success) {
+            gateway.start(code);
+            return;
+        }
+        await new Promise(r => setTimeout(r, 200));
+    }
+
+    // Default to watching primary target
+    gateway.start(VANITY_CODE);
+}
+
+async function modeAggressive() {
+    await sendWebhook("🚀 Sniper Started", "Mode: Aggressive Mode (High Speed)", 0xFFFF00);
+    const guildOK = await verifyGuild();
+    if (!guildOK) {
+        rl.question("\nPress Enter to return...", () => showMenu());
+        return;
+    }
+
+    const authResult = await authenticateMfa();
+    if (authResult === "ALREADY_CLAIMED") {
+        console.log(`\x1b[35m[Aggressive] 🛡️ Vanity '${VANITY_CODE}' is already active! Starting Guard.\x1b[0m`);
+        gateway.start(VANITY_CODE);
+        return;
+    }
+
+    // Start Gateway for real-time backup events
+    gateway.start(VANITY_CODE);
+
+    console.log(`\x1b[36m[Aggressive] 🚀 STARTING MONITORING FOR: ${VANITY_CODES.join(', ')}\x1b[0m`);
     console.log(`\x1b[33mPress Ctrl+C to stop.\x1b[0m`);
 
-    const CHECK_INTERVAL = 30;
+    const CHECK_INTERVAL = 150; // Stable polling interval to protect from 429 bans
     let nextCheckTime = Date.now();
     let checks = 0;
-
-    const statsShowInterval = 100; // Show stats every 100 checks
+    const statsShowInterval = 25;
 
     while (true) {
         const now = Date.now();
         if (now >= nextCheckTime) {
             checks++;
 
-            for (const code of VANITY_CODES) {
-                // Check
-                const resp = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, null, {}, false);
-                let data = {};
-                try { data = JSON.parse(resp); } catch { }
+            // Query current guild vanity once per cycle
+            const res = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, null, {}, false);
 
-                if (data.code !== code) {
-                    console.log(`\x1b[31m[Aggressive] 🚨 ALERT! Vanity '${code}' is missing! (Current: ${data.code || "NONE"}) Claiming NOW...\x1b[0m`);
-                    const success = await tryClaim(token, code, true);
+            if (res.statusCode === 429) {
+                const retryAfter = res.json?.retry_after || parseFloat(res.headers['retry-after']) || 2;
+                console.log(`\n\x1b[33m[Aggressive] ⏳ Rate limit reached (429). Pausing for ${retryAfter}s...\x1b[0m`);
+                await new Promise(r => setTimeout(r, Math.ceil(retryAfter * 1000)));
+                nextCheckTime = Date.now() + CHECK_INTERVAL;
+                continue;
+            }
+
+            if (res.statusCode === 200 && res.json) {
+                const currentVanity = res.json.code;
+                if (currentVanity && VANITY_CODES.includes(currentVanity)) {
+                    // One of our target vanities is currently secured
+                    gateway.setActiveCode(currentVanity);
+                } else {
+                    console.log(`\n\x1b[31m[Aggressive] 🚨 Current vanity is '${currentVanity || "NONE"}'. Target missing! Claiming...\x1b[0m`);
+                    for (const code of VANITY_CODES) {
+                        const success = await tryClaim(code, true);
+                        if (success) {
+                            gateway.setActiveCode(code);
+                            return;
+                        }
+                    }
+                }
+            } else if (res.statusCode === 404) {
+                console.log(`\n\x1b[31m[Aggressive] 🚨 Guild currently has no vanity! Claiming...\x1b[0m`);
+                for (const code of VANITY_CODES) {
+                    const success = await tryClaim(code, true);
                     if (success) {
-                        establishGatewayConnection(token, code);
+                        gateway.setActiveCode(code);
                         return;
                     }
                 }
             }
 
             if (checks % statsShowInterval === 0) {
-                process.stdout.write(`\x1b[36m[Aggressive] Pulse: ${checks} cycles completed...\r\x1b[0m`);
+                process.stdout.write(`\x1b[36m[Aggressive] Pulse: ${checks} checks completed...\r\x1b[0m`);
             }
 
             nextCheckTime = now + CHECK_INTERVAL;
@@ -417,7 +878,7 @@ async function modeAggressive() {
 
         const sleepTime = Math.max(0, nextCheckTime - Date.now());
         if (sleepTime > 0) {
-            await new Promise(r => setTimeout(r, sleepTime));
+            await new Promise(r => setTimeout(r, Math.min(sleepTime, 50)));
         }
     }
 }
@@ -440,7 +901,9 @@ async function modeScheduled() {
     const targetTs = targetDate.getTime();
     console.log(`\x1b[32mTarget Locked: ${targetDate.toLocaleString()}\x1b[0m`);
 
-    sendWebhook("🕒 Scheduled Snipe Active", `Monitoring until **${targetDate.toLocaleString()}** for **${VANITY_CODE}**`, 0x00FFFF);
+    await sendWebhook("🕒 Scheduled Snipe Active", `Monitoring until **${targetDate.toLocaleString()}** for **${VANITY_CODES.join(', ')}**`, 0x00FFFF);
+
+    let mfaPreArmed = false;
 
     const countdown = setInterval(() => {
         const now = Date.now();
@@ -451,7 +914,7 @@ async function modeScheduled() {
             return;
         }
 
-        if (diff > 10000) { // More than 10s left
+        if (diff > 10000) {
             const hours = Math.floor(diff / 3600000);
             const mins = Math.floor((diff % 3600000) / 60000);
             const secs = Math.floor((diff % 60000) / 1000);
@@ -464,94 +927,45 @@ async function modeScheduled() {
         const now = Date.now();
         const diff = targetTs - now;
 
+        // Pre-arm MFA at T-60s
+        if (diff <= 60000 && !mfaPreArmed) {
+            mfaPreArmed = true;
+            console.log("\n\x1b[36m[Grace Tracker] 🛡️ Pre-arming MFA verification (T-60s)...\x1b[0m");
+            await authenticateMfa();
+        }
+
         if (diff <= 10000) { // 10 seconds before target
             clearInterval(countdown);
             console.log(`\n\x1b[31m[Grace Tracker] 🚨 T-10 SECONDS! INITIATING BURST MODE NOW!\x1b[0m`);
-            sendWebhook("🚨 BURST MODE", "Scheduled target is 10 seconds away! Starting aggressive polling.", 0xFF0000);
+            await sendWebhook("🚨 BURST MODE", "Scheduled target is 10 seconds away! Starting burst claim attempts.", 0xFF0000);
 
-            // Switch to logic similar to modeAggressive but even more prioritized
-            const burstInterval = 25; // Even faster 25ms
-            let nextCheck = Date.now();
-            const token = await authenticateMfa();
-            if (!token) break;
+            const burstInterval = 50;
+            let nextBurst = Date.now();
 
-            while (Date.now() < targetTs + 5000) { // Run for 5s after target to be safe
-                if (Date.now() >= nextCheck) {
+            while (Date.now() < targetTs + 5000) { // Run until 5s after target
+                const current = Date.now();
+                if (current >= nextBurst) {
                     for (const code of VANITY_CODES) {
-                        sendHttpRequest('PATCH', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, { code: code }, { 'X-Discord-MFA-Authorization': token }, false).then(resp => {
-                            if (resp.includes(`"${code}"`)) {
-                                console.log(`\x1b[32m!!! SUCCESS !!! SCHEDULED SNIPE VICTORY: ${code} !\x1b[0m`);
-                                process.exit(0);
-                            }
-                        });
+                        const success = await tryClaim(code, false);
+                        if (success) {
+                            console.log(`\x1b[32m!!! SUCCESS !!! SCHEDULED SNIPE VICTORY: ${code} !\x1b[0m`);
+                            await new Promise(r => setTimeout(r, 1000));
+                            process.exit(0);
+                        }
                     }
-                    nextCheck = Date.now() + burstInterval;
+                    nextBurst = current + burstInterval;
                 }
-                await new Promise(r => setTimeout(r, 5));
+                await new Promise(r => setTimeout(r, 10));
             }
+
             console.log("\n\x1b[33m[Grace Tracker] Target window passed. Returning to menu.\x1b[0m");
             break;
         }
-        await new Promise(r => setTimeout(r, 100)); // Sleep 100ms when far away
+
+        await new Promise(r => setTimeout(r, 200));
     }
-    rl.question("\nPress Enter...", () => showMenu());
-}
 
-function establishGatewayConnection(mfaToken, activeCode) {
-    const ws = new WebSocket('wss://gateway.discord.gg/?v=9&encoding=json');
-
-    ws.on('open', () => {
-        console.log("\x1b[36m[Gateway] Connected.\x1b[0m");
-        sendWebhook("📡 Gateway Connected", "Listening for GUILD_UPDATE events...", 0x00FFFF);
-        ws.send(JSON.stringify({
-            op: 2,
-            d: {
-                token: USER_TOKEN,
-                intents: 1,
-                properties: { $os: 'linux', $browser: 'Discord Client', $device: 'desktop' }
-            }
-        }));
-    });
-
-    ws.on('message', async (msg) => {
-        try {
-            const packet = JSON.parse(msg);
-            if (packet.s) latestSequence = packet.s;
-
-            if (packet.op === 10) {
-                if (heartbeatTimer) clearInterval(heartbeatTimer);
-                heartbeatTimer = setInterval(() => {
-                    ws.send(JSON.stringify({ op: 1, d: latestSequence }));
-                }, packet.d.heartbeat_interval);
-            } else if (packet.t === 'GUILD_UPDATE') {
-                const g = packet.d;
-                if (g.id === TARGET_GUILD_ID) {
-                    // If the current vanity is NOT in our target list, it might have dropped or changed
-                    // Or if we are specifically watching 'activeCode'
-                    if (activeCode && g.vanity_url_code !== activeCode) {
-                        console.log(`\x1b[31m[Guard] 🚨 ALERT! URL Changed to '${g.vanity_url_code}'! RE-CLAIMING '${activeCode}' NOW!\x1b[0m`);
-                        sendWebhook("🚨 GUARD TRIGGERED", `URL dropped to **${g.vanity_url_code}**. Re-claiming **${activeCode}** immediately!`, 0xFF0000, true);
-                        await tryClaim(mfaToken, activeCode, true);
-                    } else if (!activeCode) {
-                        // If no specific code is being guarded, check if any of our codes are missing
-                        for (const code of VANITY_CODES) {
-                            if (g.vanity_url_code !== code) {
-                                // This is a bit complex because one of them will always not match if we have multiple
-                                // So Gateway mode with multiple URLs needs to be smart.
-                                // For now, let's just use the activeCode logic which is safer.
-                            }
-                        }
-                    }
-                }
-            } else if (packet.t === 'READY') {
-                console.log(`\x1b[32m[Gateway] Ready! Logged in as ${packet.d.user.username}\x1b[0m`);
-            }
-        } catch { }
-    });
-
-    ws.on('close', () => {
-        setTimeout(() => establishGatewayConnection(mfaToken, activeCode), 5000); // Pass activeCode
-    });
+    rl.question("\nPress Enter to return...", () => showMenu());
 }
 
 function showMenu() {
@@ -567,7 +981,7 @@ function showMenu() {
     `);
     console.log("\x1b[36m1. Instant Snipe (Try to claim NOW)\x1b[0m");
     console.log("\x1b[36m2. Gateway Sniper (Listen for URL changes)\x1b[0m");
-    console.log("\x1b[36m3. Aggressive Mode (High Speed - 30ms)\x1b[0m");
+    console.log("\x1b[36m3. Aggressive Mode (High Speed Monitoring)\x1b[0m");
     console.log("\x1b[36m4. Grace Period Tracker (Scheduled Snipe)\x1b[0m");
     console.log("\x1b[36m5. Configuration Check\x1b[0m");
     console.log("\x1b[31m6. Exit\x1b[0m");
@@ -590,14 +1004,15 @@ async function handleMenu(option) {
         rl.question("\nPress Enter to return...", () => showMenu());
     } else if (option === '6') {
         console.log("Exiting...");
+        gateway.stop();
         process.exit(0);
     } else {
         showMenu();
     }
 }
 
-if (!USER_TOKEN || !TARGET_GUILD_ID || !USER_PASSWORD || !VANITY_CODE) {
-    console.error("\x1b[31mHATA: .env dosyasında eksik bilgiler var!\x1b[0m");
+if (!USER_TOKEN || !TARGET_GUILD_ID || !USER_PASSWORD || VANITY_CODES.length === 0) {
+    console.error("\x1b[31m[Config Error] Missing required variables in .env (TOKEN, GUILD_ID, PASSWORD, VANITY_URL)!\x1b[0m");
     process.exit(1);
 }
 

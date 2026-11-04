@@ -1,31 +1,30 @@
 # Discord Vanity Sniper 🚀
 
-This is an advanced, high-performance Discord Vanity URL Sniper written in Node.js. It is designed to bypass modern security measures such as TLS fingerprinting and automated Bot detection.
+An advanced, high-performance Discord Vanity URL Sniper written in Node.js, built using direct TLS sockets and Discord's Gateway protocol.
 
 ## 🔥 Key Features
 
-- **Chrome Impersonation:** Uses raw `tls` sockets to mimic a real Google Chrome browser (v110+), completely bypassing Discord's "Password Mismatch" / "Token Invalid" errors caused by Python/Requests fingerprinting.
-- **Auto-MFA Solver:** Automatically detects MFA requirements (`Code 60003`) and generates a valid 2FA token using your password.
-- **Multi-URL Support (Native):** Every operation mode now automatically handles multiple vanity codes simultaneously. The sniper will monitor your entire list and lock onto the first one it successfully claims.
-- **Aggressive Mode (High Speed):** An ultra-fast monitoring loop (30ms interval) that cycles through your target list at extreme speed while maintaining stealth.
-- **Grace Period Tracker:** Schedule snipes for a specific date/time (e.g., when a lock ends). Automatically triggers **Burst Mode** (25ms frequency) 10 seconds before the target.
-- **Guard Mode:** Once a URL is claimed, the sniper automatically enters "Guard Mode", watching specifically for that URL, and instantly re-claims it if necessary.
-- **Dual-Endpoint Attack:** Simulates both the modern `/vanity-url` endpoint and the legacy `/guilds/{id}` endpoint simultaneously.
-- **Webhook Notifications:** Get real-time updates for successful claims, MFA bypasses, and Guard Mode alerts directly in your Discord channel.
+- **Direct TLS Socket & HTTP/1.1 Engine:** Uses raw TLS sockets with persistent HTTP keep-alive, chunked transfer decoding, and browser headers (`User-Agent` & `X-Super-Properties`).
+- **Auto-MFA Solver & Token Refresh:** Detects 2FA challenges (`Code 60003`), automatically submits account password verification via Discord's `/mfa/finish` endpoint, and auto-refreshes expired MFA tokens seamlessly during claims.
+- **Multi-URL Priority Support:** Set multiple vanity codes in comma-separated order. The sniper monitors your target list, prioritizes available codes, and protects already claimed vanities.
+- **Robust Gateway Integration:** Full Discord Gateway v9 lifecycle support including session resume (OP 6), heartbeat tracking with ACK verification (OP 1, OP 11), reconnect handling (OP 7), and unhandled error protection (`ws.on('error')`).
+- **Rate Limit (429) & Error Protection:** Strictly verifies HTTP status codes (200 OK) and honors `retry_after` cooldowns, preventing false alarms and rate-limit loops.
+- **Guard Mode:** Once a target vanity is claimed or detected, the sniper watches `GUILD_UPDATE` gateway events in real time and re-claims immediately if the URL drops.
+- **Discord Webhook Alerts:** Real-time notifications for successful snipes, Guard mode triggers, MFA events, and errors.
 
 ## 🛠️ Installation
 
-1.  **Install Node.js:** Ensure you have [Node.js](https://nodejs.org/) (v18 or higher) installed.
-2.  **Download Source:** Clone this repository or download the files.
-3.  **Install Dependencies:**
-    Open a terminal in the project folder and run:
-    ```bash
-    npm install
-    ```
+1. **Install Node.js:** Ensure you have [Node.js](https://nodejs.org/) (v18 or higher) installed.
+2. **Download Source:** Clone this repository or download the files.
+3. **Install Dependencies:**
+   Open a terminal in the project folder and run:
+   ```bash
+   npm install
+   ```
 
 ## ⚙️ Configuration
 
-Create a `.env` file in the root directory (copy `.env.example`) and fill in your details:
+Copy `.env.example` to `.env` in the root directory and fill in your details:
 
 ```ini
 TOKEN=your_user_token_here
@@ -47,16 +46,15 @@ node advanced_sniper.js
 ```
 
 ### 🎮 Available Modes
-1.  **Instant Snipe:** Checks the entire `VANITY_URL` list immediately and attempts one-time claims.
-2.  **Gateway Sniper:** Listens for Discord `GUILD_UPDATE` events. Best for catching a URL the moment it drops without hammering the API.
-3.  **Aggressive Mode:** An ultra-fast, high-frequency loop (30ms) iterating through your target list. Best for high-stakes competition.
-4.  **Grace Period Tracker:** Schedule a snipe based on a specific unlock time (e.g., after 30 days). Displays a countdown and initiates a 25ms polling burst right before the target.
-5.  **Configuration Check:** Quickly verify your loaded settings.
-6.  **Exit:** Gracefully closes the sniper.
+1. **Instant Snipe:** Iterates through the `VANITY_URL` list immediately and attempts one-time claims.
+2. **Gateway Sniper:** Listens for Discord `GUILD_UPDATE` events. Best for catching a URL the moment it drops without hammering the API.
+3. **Aggressive Mode:** High-frequency loop monitoring your guild's vanity state with intelligent 429 rate-limit backoff.
+4. **Grace Period Tracker:** Schedule a snipe for a specific unlock date/time. Pre-arms MFA ahead of time and bursts claims around the target timestamp.
+5. **Configuration Check:** Displays loaded settings with clean formatting.
+6. **Exit:** Gracefully closes sockets and shuts down.
 
 ## ⚠️ Disclaimer
-This tool is for educational purposes only. Automating user accounts (Self-botting) is against Discord's Terms of Service. Use at your own risk.
-
+This tool is for educational and security auditing purposes only. Automating user accounts (Self-botting) is against Discord's Terms of Service. Use at your own risk.
 
 ## Credits
 Created by [Spectral](https://github.com/S-pectral).
