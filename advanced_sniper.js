@@ -749,6 +749,75 @@ async function verifyGuilds() {
     return validatedGuilds.length > 0;
 }
 
+async function ensureTargetGuildMembership() {
+    console.log(`\x1b[36m[Auto-Join] 🔍 Checking server membership for target vanity codes (${VANITY_CODES.join(', ')})...\x1b[0m`);
+
+    for (const code of VANITY_CODES) {
+        // 1. Resolve invite to find the guild holding the vanity
+        const inviteRes = await sendHttpRequest('GET', `/api/v9/invites/${code}`, null, {}, true);
+        const inviteData = inviteRes.json || {};
+
+        if (inviteRes.statusCode !== 200 || !inviteData.guild?.id) {
+            console.log(`\x1b[33m[Auto-Join] ℹ️ Vanity '${code}' is not currently assigned to any guild (Available/Unknown).\x1b[0m`);
+            continue;
+        }
+
+        const holderGuildId = inviteData.guild.id;
+        const holderGuildName = inviteData.guild.name || 'Unknown Guild';
+
+        // If this guild is already one of our own target guilds, skip
+        if (TARGET_GUILD_IDS.includes(holderGuildId)) {
+            console.log(`\x1b[32m[Auto-Join] ✅ Vanity '${code}' is already on our target guild '${holderGuildName}'!\x1b[0m`);
+            continue;
+        }
+
+        // 2. Check each token to see if any token is already a member
+        let alreadyInside = false;
+
+        for (let i = 0; i < USER_TOKENS.length; i++) {
+            const token = USER_TOKENS[i];
+            const accName = validatedAccounts[i]?.user?.username || `Token-${i + 1}`;
+            const guildsRes = await sendHttpRequest('GET', '/api/v9/users/@me/guilds', null, {}, true, token);
+
+            if (Array.isArray(guildsRes.json)) {
+                if (guildsRes.json.some(g => g.id === holderGuildId)) {
+                    console.log(`\x1b[32m[Auto-Join] ✅ Account '${accName}' is already inside '${holderGuildName}' (${holderGuildId}). Gateway is watching!\x1b[0m`);
+                    alreadyInside = true;
+                    break;
+                }
+            }
+        }
+
+        if (alreadyInside) continue;
+
+        // 3. None of our accounts are inside! Attempt auto-join
+        console.log(`\x1b[33m[Auto-Join] ⚠️ Account(s) are NOT in '${holderGuildName}' (${holderGuildId}). Attempting auto-join via invite '${code}'...\x1b[0m`);
+
+        for (let i = 0; i < USER_TOKENS.length; i++) {
+            const token = USER_TOKENS[i];
+            const accName = validatedAccounts[i]?.user?.username || `Token-${i + 1}`;
+
+            const joinRes = await sendHttpRequest('POST', `/api/v9/invites/${code}`, {}, {}, true, token);
+            const joinData = joinRes.json || {};
+
+            if (joinRes.statusCode === 200) {
+                console.log(`\x1b[32m[Auto-Join] 🎉 Account '${accName}' SUCCESSFULLY JOINED '${holderGuildName}'! Gateway will now capture drop events!\x1b[0m`);
+                await sendWebhook("🎉 Otomatik Katılım Başarılı", `Hesap **${accName}**, **${code}** URL'sine sahip **${holderGuildName}** sunucusuna katıldı!`, 0x00FF00);
+                alreadyInside = true;
+                break;
+            } else if (joinData.captcha_key || joinData.captcha_service) {
+                console.log(`\x1b[31m[Auto-Join] ⚠️ Discord CAPTCHA Doğrulaması İstedi (${accName})!\x1b[0m`);
+                console.log(`\x1b[33m👉 Discord güvenlik sebebiyle bu sunucuya API üzerinden otomatik katılmaya hCaptcha koydu.\x1b[0m`);
+                console.log(`\x1b[32m👉 Lütfen Discord uygulamasından/tarayıcından bu hesapla 'https://discord.gg/${code}' adresine tıklayarak sunucuya manuel katıl!\x1b[0m`);
+                await sendWebhook("⚠️ Manuel Katılım Gerekli", `Discord **${code}** sunucusuna katılmak için hCaptcha istedi. Lütfen hesaptan **https://discord.gg/${code}** adresine manuel katılın!`, 0xFFA500);
+                break;
+            } else {
+                console.log(`\x1b[31m[Auto-Join] ❌ Katılma başarısız (${accName}): ${joinData.message || joinRes.statusMessage} (Status: ${joinRes.statusCode})\x1b[0m`);
+            }
+        }
+    }
+}
+
 // --- GATEWAY MANAGER (MULTI-TOKEN & MULTI-GUILD) ---
 
 class GatewayClient {
@@ -1060,11 +1129,15 @@ async function modeInstant() {
 
 async function modeGateway() {
     await sendWebhook("🚀 Sniper Started", "Mode: Gateway Sniper (Multi-Token Guard Active)", 0xFFFF00);
+    await verifyTokens();
     const guildsOK = await verifyGuilds();
     if (!guildsOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
         return;
     }
+
+    // Auto-check and auto-join the guilds holding target vanities
+    await ensureTargetGuildMembership();
 
     const authResult = await authenticateMfa();
     if (authResult === "ALREADY_CLAIMED") {
@@ -1290,6 +1363,7 @@ async function handleMenu(option) {
         printConfig();
         await verifyTokens();
         await verifyGuilds();
+        await ensureTargetGuildMembership();
         rl.question("\nPress Enter to return...", () => showMenu());
     } else if (option === '6') {
         console.log("Exiting...");
