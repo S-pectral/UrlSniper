@@ -1,0 +1,7 @@
+# Proxy Listesi (Her satira bir proxy girin)
+# Desteklenen formatlar:
+# ip:port
+# ip:port:kullanici:sifre
+# http://kullanici:sifre@ip:port
+#
+# Eger proxy kullanmak istemiyorsaniz bu dosyayi bos birakabilirsiniz.

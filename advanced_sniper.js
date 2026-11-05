@@ -1,5 +1,8 @@
 import WebSocket from 'ws';
 import tls from 'tls';
+import net from 'net';
+import path from 'path';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import readline from 'readline';
 import { Buffer } from 'node:buffer';
@@ -7,42 +10,256 @@ import { Buffer } from 'node:buffer';
 // Load config
 dotenv.config();
 
-const USER_TOKEN = process.env.TOKEN;
-const TARGET_GUILD_ID = process.env.GUILD_ID;
+const USER_TOKENS = (process.env.TOKENS || process.env.TOKEN || "").split(",").map(t => t.trim()).filter(Boolean);
+const USER_TOKEN = USER_TOKENS[0]; // Primary token for claims
+
+const TARGET_GUILD_IDS = (process.env.GUILD_IDS || process.env.GUILD_ID || "").split(",").map(g => g.trim()).filter(Boolean);
+const TARGET_GUILD_ID = TARGET_GUILD_IDS[0]; // Primary target guild
+
 const USER_PASSWORD = process.env.PASSWORD;
 const VANITY_CODES = (process.env.VANITY_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-const VANITY_CODE = VANITY_CODES[0]; // Primary vanity for backward compatibility/guard
+const VANITY_CODE = VANITY_CODES[0];
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
 let mfaAuthToken = null;
+let activeProxy = null;
+let validatedAccounts = [];
+let validatedGuilds = [];
+
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
 
-const printConfig = () => {
-    const vanityStr = VANITY_CODES.join(", ") || "MISSING";
-    const displayVanity = vanityStr.length > 36 ? vanityStr.substring(0, 33) + "..." : vanityStr;
+// --- PROXY HANDLER & TESTER ---
 
-    console.log(`
-    \x1b[36m┌──────────────────────┬──────────────────────────────────────┐
-    │ \x1b[1mCONFIGURATION\x1b[0m\x1b[36m        │ \x1b[1mSTATUS\x1b[0m\x1b[36m                               │
-    ├──────────────────────┼──────────────────────────────────────┤
-    │ Token                │ ${USER_TOKEN ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
-    │ Guild ID             │ \x1b[33m${(TARGET_GUILD_ID || "MISSING").padEnd(36)}\x1b[36m │
-    │ Vanity URL(s)        │ \x1b[35m${displayVanity.padEnd(36)}\x1b[36m │
-    │ Password             │ ${USER_PASSWORD ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
-    │ Webhook              │ ${WEBHOOK_URL ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
-    └──────────────────────┴──────────────────────────────────────┘\x1b[0m`);
+function parseProxy(rawLine) {
+    if (!rawLine) return null;
+    let line = rawLine.trim();
+    if (!line || line.startsWith('#')) return null;
 
-    if (vanityStr.length > 36) {
-        console.log(`    \x1b[35m[Vanity List]\x1b[0m ${vanityStr}\n`);
+    line = line.replace(/^(https?:\/\/)/i, '');
+
+    if (line.includes('@')) {
+        const [authPart, hostPortPart] = line.split('@');
+        const [host, port] = hostPortPart.split(':');
+        return {
+            host,
+            port: parseInt(port, 10),
+            auth: authPart,
+            raw: rawLine.trim()
+        };
     }
-};
 
-// --- RAW TLS & HTTP/1.1 PARSER ---
+    const parts = line.split(':');
+    if (parts.length === 4) {
+        return {
+            host: parts[0],
+            port: parseInt(parts[1], 10),
+            auth: `${parts[2]}:${parts[3]}`,
+            raw: rawLine.trim()
+        };
+    }
 
-function createTlsSocket() {
+    if (parts.length === 2) {
+        return {
+            host: parts[0],
+            port: parseInt(parts[1], 10),
+            auth: null,
+            raw: rawLine.trim()
+        };
+    }
+
+    return null;
+}
+
+function testProxyConnection(proxy) {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const netSocket = net.connect({
+            host: proxy.host,
+            port: proxy.port
+        });
+
+        netSocket.setNoDelay(true);
+
+        let finished = false;
+        const timer = setTimeout(() => {
+            if (!finished) {
+                finished = true;
+                netSocket.destroy();
+                resolve({ success: false, error: 'Connection timed out (5s)' });
+            }
+        }, 5000);
+
+        netSocket.once('error', (err) => {
+            if (!finished) {
+                finished = true;
+                clearTimeout(timer);
+                resolve({ success: false, error: err.message });
+            }
+        });
+
+        netSocket.once('connect', () => {
+            let connectReq = `CONNECT canary.discord.com:443 HTTP/1.1\r\nHost: canary.discord.com:443\r\n`;
+            if (proxy.auth) {
+                const b64 = Buffer.from(proxy.auth).toString('base64');
+                connectReq += `Proxy-Authorization: Basic ${b64}\r\n`;
+            }
+            connectReq += `\r\n`;
+            netSocket.write(connectReq);
+        });
+
+        let buf = '';
+        const onData = (chunk) => {
+            buf += chunk.toString('utf-8');
+            if (buf.includes('\r\n\r\n')) {
+                netSocket.removeListener('data', onData);
+                if (!finished) {
+                    finished = true;
+                    clearTimeout(timer);
+                    netSocket.destroy();
+
+                    const statusLine = buf.split('\r\n')[0] || '';
+                    const match = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/);
+                    const statusCode = match ? parseInt(match[1], 10) : 0;
+
+                    if (statusCode >= 200 && statusCode < 300) {
+                        const latency = Date.now() - start;
+                        resolve({ success: true, latency });
+                    } else {
+                        resolve({ success: false, error: `Proxy returned HTTP ${statusCode}: ${statusLine}` });
+                    }
+                }
+            }
+        };
+        netSocket.on('data', onData);
+    });
+}
+
+async function initProxies() {
+    const proxyFilePath = path.join(process.cwd(), 'proxy.txt');
+    if (!fs.existsSync(proxyFilePath)) {
+        const template = `# Proxy Listesi (Her satira bir proxy girin)
+# Desteklenen formatlar:
+# ip:port
+# ip:port:kullanici:sifre
+# http://kullanici:sifre@ip:port
+#
+# Eger proxy kullanmak istemiyorsaniz bu dosyayi bos birakabilirsiniz.
+`;
+        fs.writeFileSync(proxyFilePath, template, 'utf-8');
+        console.log("\x1b[36m[Proxy] ℹ️ 'proxy.txt' olusturuldu (bos). Dogrudan baglanti kullanilacak.\x1b[0m");
+        return null;
+    }
+
+    const content = fs.readFileSync(proxyFilePath, 'utf-8');
+    const lines = content.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+
+    if (lines.length === 0) {
+        console.log("\x1b[36m[Proxy] ℹ️ 'proxy.txt' bos. Dogrudan baglanti (Direct Connection) kullaniliyor.\x1b[0m");
+        return null;
+    }
+
+    console.log(`\x1b[36m[Proxy] 🔍 'proxy.txt' icinde ${lines.length} proxy bulundu. Baglanti test ediliyor...\x1b[0m`);
+
+    for (const line of lines) {
+        const parsed = parseProxy(line);
+        if (!parsed) {
+            console.log(`\x1b[33m[Proxy] ⚠️ Gecersiz proxy formati: ${line}\x1b[0m`);
+            continue;
+        }
+
+        const res = await testProxyConnection(parsed);
+        if (res.success) {
+            console.log(`\x1b[32m[Proxy] ✅ Proxy aktif: ${parsed.host}:${parsed.port} (Gecikme: ${res.latency}ms)\x1b[0m`);
+            parsed.latency = res.latency;
+            return parsed;
+        } else {
+            console.log(`\x1b[31m[Proxy] ❌ Proxy calismiyor: ${parsed.host}:${parsed.port} (${res.error})\x1b[0m`);
+        }
+    }
+
+    console.log("\x1b[33m[Proxy] ⚠️ Calisan proxy bulunamadi! DOGRUDAN BAGLANTIYA geciliyor.\x1b[0m");
+    return null;
+}
+
+// --- TLS SOKET & HTTP/1.1 PARSER ---
+
+function createTlsSocket(proxy = activeProxy) {
+    if (proxy) {
+        return new Promise((resolve, reject) => {
+            const netSocket = net.connect({
+                host: proxy.host,
+                port: proxy.port
+            });
+            netSocket.setNoDelay(true);
+
+            let isResolved = false;
+            const timer = setTimeout(() => {
+                if (!isResolved) {
+                    isResolved = true;
+                    netSocket.destroy();
+                    reject(new Error(`Proxy connection timeout: ${proxy.host}:${proxy.port}`));
+                }
+            }, 6000);
+
+            netSocket.once('error', (err) => {
+                if (!isResolved) {
+                    isResolved = true;
+                    clearTimeout(timer);
+                    reject(err);
+                }
+            });
+
+            netSocket.once('connect', () => {
+                let connectReq = `CONNECT canary.discord.com:443 HTTP/1.1\r\nHost: canary.discord.com:443\r\n`;
+                if (proxy.auth) {
+                    const b64 = Buffer.from(proxy.auth).toString('base64');
+                    connectReq += `Proxy-Authorization: Basic ${b64}\r\n`;
+                }
+                connectReq += `\r\n`;
+                netSocket.write(connectReq);
+            });
+
+            let headerBuf = '';
+            const onData = (chunk) => {
+                headerBuf += chunk.toString('utf-8');
+                if (headerBuf.includes('\r\n\r\n')) {
+                    netSocket.removeListener('data', onData);
+                    clearTimeout(timer);
+                    if (!isResolved) {
+                        isResolved = true;
+                        const statusLine = headerBuf.split('\r\n')[0] || '';
+                        const match = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/);
+                        const statusCode = match ? parseInt(match[1], 10) : 0;
+
+                        if (statusCode >= 200 && statusCode < 300) {
+                            const tlsSocket = tls.connect({
+                                socket: netSocket,
+                                host: 'canary.discord.com',
+                                servername: 'canary.discord.com',
+                                rejectUnauthorized: true,
+                                minVersion: 'TLSv1.2',
+                                maxVersion: 'TLSv1.3'
+                            });
+                            tlsSocket.setNoDelay(true);
+                            tlsSocket.on('error', () => {
+                                try { tlsSocket.destroy(); } catch { }
+                            });
+                            resolve(tlsSocket);
+                        } else {
+                            netSocket.destroy();
+                            reject(new Error(`Proxy CONNECT error: ${statusLine}`));
+                        }
+                    }
+                }
+            };
+            netSocket.on('data', onData);
+        });
+    }
+
+    // Direct TLS socket
     const socket = tls.connect({
         host: 'canary.discord.com',
         port: 443,
@@ -52,12 +269,11 @@ function createTlsSocket() {
     });
     socket.setNoDelay(true);
 
-    // Keep permanent error handler so idle sockets never crash Node
     socket.on('error', () => {
         try { socket.destroy(); } catch { }
     });
 
-    return socket;
+    return Promise.resolve(socket);
 }
 
 function parseHttpResponse(rawBuffer, isSocketEnded = false) {
@@ -176,32 +392,36 @@ function parseHttpResponse(rawBuffer, isSocketEnded = false) {
 let sharedKeepAliveSocket = null;
 let sharedSocketBusy = false;
 
-async function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false, attempt = 1, timeoutMs = 8000) {
-    return new Promise((resolve) => {
-        const payload = body ? JSON.stringify(body) : '';
-        let socket;
-        let isShared = false;
+async function sendHttpRequest(method, path, body = null, extraHeaders = {}, closeConnection = false, token = USER_TOKEN, attempt = 1, timeoutMs = 8000) {
+    const payload = body ? JSON.stringify(body) : '';
+    let socket;
+    let isShared = false;
 
-        if (!closeConnection) {
-            if (sharedKeepAliveSocket && !sharedKeepAliveSocket.destroyed && !sharedSocketBusy) {
+    if (!closeConnection) {
+        if (sharedKeepAliveSocket && !sharedKeepAliveSocket.destroyed && !sharedSocketBusy) {
+            socket = sharedKeepAliveSocket;
+            sharedSocketBusy = true;
+            isShared = true;
+        } else if (!sharedSocketBusy) {
+            try {
+                sharedKeepAliveSocket = await createTlsSocket();
                 socket = sharedKeepAliveSocket;
                 sharedSocketBusy = true;
                 isShared = true;
-            } else if (!sharedSocketBusy) {
-                sharedKeepAliveSocket = createTlsSocket();
-                socket = sharedKeepAliveSocket;
-                sharedSocketBusy = true;
-                isShared = true;
-            } else {
-                // Shared socket is busy handling another in-flight request: create dedicated socket
-                socket = createTlsSocket();
+            } catch {
+                socket = await createTlsSocket();
                 isShared = false;
             }
         } else {
-            socket = createTlsSocket();
+            socket = await createTlsSocket();
             isShared = false;
         }
+    } else {
+        socket = await createTlsSocket();
+        isShared = false;
+    }
 
+    return new Promise((resolve) => {
         const headers = [
             `${method} ${path} HTTP/1.1`,
             'Host: canary.discord.com',
@@ -209,7 +429,7 @@ async function sendHttpRequest(method, path, body = null, extraHeaders = {}, clo
             'Content-Type: application/json',
             `Content-Length: ${Buffer.byteLength(payload)}`,
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
-            `Authorization: ${USER_TOKEN}`,
+            `Authorization: ${token}`,
             'X-Super-Properties: eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRmlyZWZveCIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJ0ci1UUiIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQ7IHJ2OjEzMy4wKSBHZWNrby8yMDEwMDEwMSBGaXJlZm94LzEzMy4wIiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTMzLjAiLCJvc192ZXJzaW9uIjoiMTAiLCJyZWZlcnJlciI6Imh0dHBzOi8vd3d3Lmdvb2dsZS5jb20vIiwicmVmZXJyaW5nX2RvbWFpbiI6Ind3dy5nb29nbGUuY29tIiwic2VhcmNoX2VuZ2luZSI6Imdvb2dsZSIsInJlZmVycmVyX2N1cnJlbnQiOiIiLCJyZWZlcnJpbmdfZG9tYWluX2N1cnJlbnQiOiIiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfYnVpbGRfbnVtYmVyIjozNTYxNDAsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImhhc19jbGllbnRfbW9kcyI6ZmFsc2V9'
         ];
 
@@ -267,7 +487,7 @@ async function sendHttpRequest(method, path, body = null, extraHeaders = {}, clo
             }
 
             if (attempt <= 3) {
-                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1, timeoutMs));
+                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, token, attempt + 1, timeoutMs));
             } else {
                 cleanupAndFinish({ statusCode: 408, statusMessage: 'Request Timeout', body: '' });
             }
@@ -300,7 +520,7 @@ async function sendHttpRequest(method, path, body = null, extraHeaders = {}, clo
             }
 
             if (attempt <= 3) {
-                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, attempt + 1, timeoutMs));
+                resolve(sendHttpRequest(method, path, body, extraHeaders, closeConnection, token, attempt + 1, timeoutMs));
             } else {
                 cleanupAndFinish({ statusCode: 500, statusMessage: err.message, body: '' });
             }
@@ -310,7 +530,6 @@ async function sendHttpRequest(method, path, body = null, extraHeaders = {}, clo
         socket.once('end', onEnd);
         socket.once('error', onError);
 
-        // Immediate check if residualBuffer already contained complete response
         if (recvBuffer.length > 0) {
             const initialCheck = parseHttpResponse(recvBuffer, false);
             if (initialCheck && !initialCheck.error) {
@@ -414,10 +633,10 @@ async function authenticateMfa() {
 
 // --- CLAIM LOGIC ---
 
-async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) {
+async function tryClaim(code = VANITY_CODE, targetGuildId = TARGET_GUILD_ID, keepAlive = false, isRetry = false) {
     if (!code) return false;
 
-    console.log(`\x1b[36m[Sniper] 🔫 Attempting to claim '${code}'...\x1b[0m`);
+    console.log(`\x1b[36m[Sniper] 🔫 Attempting to claim '${code}' on Guild '${targetGuildId}'...\x1b[0m`);
 
     const headers = {};
     if (mfaAuthToken) {
@@ -426,7 +645,7 @@ async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) 
 
     const res = await sendHttpRequest(
         'PATCH',
-        `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`,
+        `/api/v9/guilds/${targetGuildId}/vanity-url`,
         { code: code },
         headers,
         true
@@ -434,7 +653,7 @@ async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) 
 
     const result = res.json || {};
 
-    // 1. Handle MFA challenge (code 60003) - refresh expired or missing MFA token
+    // 1. Handle MFA challenge (code 60003)
     if (result.code === 60003 && result.mfa?.ticket) {
         if (isRetry) {
             console.log("\x1b[31m[MFA] ❌ Code 60003 returned again after solving MFA.\x1b[0m");
@@ -443,7 +662,7 @@ async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) 
         console.log("\x1b[33m[Sniper] ⚠️ MFA required or token expired (Code 60003). Auto-solving now...\x1b[0m");
         const freshToken = await solveMfaChallenge(result.mfa.ticket);
         if (freshToken) {
-            return await tryClaim(code, keepAlive, true);
+            return await tryClaim(code, targetGuildId, keepAlive, true);
         }
         return false;
     }
@@ -456,24 +675,24 @@ async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) 
         return false;
     }
 
-    // 3. Check Success strictly
+    // 3. Strict Victory Verification
     const isSuccess = res.statusCode === 200 && (result.code === code || result.vanity_url_code === code);
 
     if (isSuccess) {
-        console.log(`\x1b[32m!!! VICTORY !!! URL '${code}' SNIPED SUCCESSFULLY !\x1b[0m`);
-        await sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${code}\n**Guild:** ${TARGET_GUILD_ID}`, 0x00FF00, true);
+        console.log(`\x1b[32m!!! VICTORY !!! URL '${code}' SNIPED SUCCESSFULLY ON GUILD ${targetGuildId} !\x1b[0m`);
+        await sendWebhook("🎯 VANITY URL SNIPED!", `**URL:** ${code}\n**Guild:** ${targetGuildId}`, 0x00FF00, true);
 
         if (keepAlive) {
-            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. Watching this server to re-claim if the URL drops.\x1b[0m");
-            await sendWebhook("🛡️ Guard Mode Active", `Watching for changes to **${code}**...`, 0x0000FF);
+            console.log("\x1b[35m[Guard] 🛡️ Entering GUARD MODE. Watching servers to re-claim if the URL drops.\x1b[0m");
+            await sendWebhook("🛡️ Guard Mode Active", `Watching for changes to **${code}** on **${targetGuildId}**...`, 0x0000FF);
         }
         return true;
     }
 
     // 4. Detailed error diagnosis
     if (result.code === 50013) {
-        console.log("\x1b[31m[Sniper] ⛔ PERMISSION DENIED (50013): Missing 'Manage Server' permission.\x1b[0m");
-        await sendWebhook("⛔ Permission Denied", "Code 50013: Missing 'Manage Server' permission.", 0xFF0000);
+        console.log(`\x1b[31m[Sniper] ⛔ PERMISSION DENIED (50013): Missing 'Manage Server' on Guild ${targetGuildId}.\x1b[0m`);
+        await sendWebhook("⛔ Permission Denied", `Code 50013: Missing 'Manage Server' permission on Guild ${targetGuildId}.`, 0xFF0000);
     } else if (result.code === 50020) {
         console.log(`\x1b[33m[Sniper] ⚠️ Vanity '${code}' is already taken (Code: 50020).\x1b[0m`);
     } else if (result.code === 50035) {
@@ -487,52 +706,64 @@ async function tryClaim(code = VANITY_CODE, keepAlive = false, isRetry = false) 
     return false;
 }
 
-// --- CHECKS ---
+// --- VERIFICATION CHECKS ---
 
-async function verifyGuild() {
-    console.log(`\x1b[36m[Check] Verifying Guild ID: ${TARGET_GUILD_ID}...\x1b[0m`);
-    const res = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}`, null, {}, true);
+async function verifyTokens() {
+    validatedAccounts = [];
+    console.log(`\x1b[36m[Check] Verifying ${USER_TOKENS.length} token(s)...\x1b[0m`);
 
-    const data = res.json || {};
-
-    if (res.statusCode === 200 && data.id === TARGET_GUILD_ID) {
-        console.log(`\x1b[32m[Check] ✅ Guild Found: "${data.name}" (Owner ID: ${data.owner_id})\x1b[0m`);
-        return true;
-    } else {
-        console.log(`\x1b[31m[Check] ❌ Guild Check Failed! (Status: ${res.statusCode})\x1b[0m`);
-        if (data.code === 10004) console.log("\x1b[33m👉 Diagnosis: UNKNOWN GUILD. The ID is wrong or you are not in the server.\x1b[0m");
-        if (data.code === 10008) console.log("\x1b[33m👉 Diagnosis: UNKNOWN MESSAGE. You likely copied a Message ID, not the Server ID!\x1b[0m");
-        await sendWebhook("⚠️ Config Error", "Guild Verification Failed. Check ID.", 0xFF0000);
-        return false;
+    for (let i = 0; i < USER_TOKENS.length; i++) {
+        const token = USER_TOKENS[i];
+        const res = await sendHttpRequest('GET', '/api/v9/users/@me', null, {}, true, token);
+        if (res.statusCode === 200 && res.json?.id) {
+            const acc = res.json;
+            const tag = acc.discriminator && acc.discriminator !== '0' ? `#${acc.discriminator}` : '';
+            console.log(`\x1b[32m[Auth] ✅ Token #${i + 1}: ${acc.username}${tag} (ID: ${acc.id})\x1b[0m`);
+            validatedAccounts.push({ token, user: acc });
+        } else {
+            console.log(`\x1b[31m[Auth] ❌ Token #${i + 1} INVALID! (Status: ${res.statusCode})\x1b[0m`);
+        }
     }
+    return validatedAccounts.length > 0;
 }
 
-// --- GATEWAY MANAGER ---
+async function verifyGuilds() {
+    validatedGuilds = [];
+    console.log(`\x1b[36m[Check] Verifying ${TARGET_GUILD_IDS.length} target guild(s)...\x1b[0m`);
 
-class GatewayManager {
-    constructor() {
+    for (let i = 0; i < TARGET_GUILD_IDS.length; i++) {
+        const guildId = TARGET_GUILD_IDS[i];
+        const res = await sendHttpRequest('GET', `/api/v9/guilds/${guildId}`, null, {}, true);
+        const data = res.json || {};
+
+        if (res.statusCode === 200 && data.id === guildId) {
+            const hasVanityFeature = Array.isArray(data.features) && data.features.includes('VANITY_URL');
+            const vanityStatus = data.vanity_url_code ? `Current: '${data.vanity_url_code}'` : 'No vanity';
+            console.log(`\x1b[32m[Check] ✅ Guild #${i + 1}: "${data.name}" (${vanityStatus}, Tier: ${data.premium_tier || 0}, Feature: ${hasVanityFeature ? 'YES' : 'NO'})\x1b[0m`);
+            validatedGuilds.push(data);
+        } else {
+            console.log(`\x1b[31m[Check] ❌ Guild #${i + 1} (${guildId}) check failed! (Status: ${res.statusCode})\x1b[0m`);
+            if (data.code === 10004) console.log("👉 Diagnosis: UNKNOWN GUILD. Account is not in this server or ID is wrong.");
+        }
+    }
+    return validatedGuilds.length > 0;
+}
+
+// --- GATEWAY MANAGER (MULTI-TOKEN & MULTI-GUILD) ---
+
+class GatewayClient {
+    constructor(token, accountName, onDropCallback) {
+        this.token = token;
+        this.accountName = accountName;
+        this.onDrop = onDropCallback;
         this.ws = null;
         this.heartbeatTimer = null;
         this.heartbeatAcked = true;
         this.sessionId = null;
         this.resumeGatewayUrl = null;
         this.latestSequence = null;
-        this.activeCode = null;
-        this.isReconnecting = false;
         this.shouldReconnect = true;
-        this.guildVanities = new Map(); // Tracks known vanities across all mutual guilds
-    }
-
-    start(codeToGuard) {
-        this.activeCode = codeToGuard || VANITY_CODE;
-        this.shouldReconnect = true;
-
-        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-            console.log(`\x1b[35m[Gateway] Active connection updated to guard/snipe: '${this.activeCode}'\x1b[0m`);
-            return;
-        }
-
-        this.connect();
+        this.guildVanities = new Map();
     }
 
     connect() {
@@ -541,34 +772,38 @@ class GatewayManager {
             ? `${this.resumeGatewayUrl}/?v=9&encoding=json`
             : 'wss://gateway.discord.gg/?v=9&encoding=json';
 
-        this.ws = new WebSocket(endpoint);
+        const wsOptions = {};
+        if (activeProxy) {
+            wsOptions.createConnection = (options, cb) => {
+                createTlsSocket(activeProxy)
+                    .then(sock => cb(null, sock))
+                    .catch(err => cb(err));
+            };
+        }
 
-        // Crucial: ws.on('error') prevents process crash on network glitches
+        this.ws = new WebSocket(endpoint, wsOptions);
+
         this.ws.on('error', (err) => {
-            console.log(`\x1b[31m[Gateway] Network Error: ${err.message}\x1b[0m`);
+            console.log(`\x1b[31m[Gateway-${this.accountName}] Error: ${err.message}\x1b[0m`);
         });
 
         this.ws.on('open', () => {
-            console.log("\x1b[36m[Gateway] Connected to Discord Gateway.\x1b[0m");
-            sendWebhook("📡 Gateway Connected", "Listening for GUILD_UPDATE events...", 0x00FFFF);
+            console.log(`\x1b[36m[Gateway-${this.accountName}] Connected.\x1b[0m`);
 
             if (this.sessionId && this.latestSequence !== null) {
-                // OP 6: Resume
-                console.log(`\x1b[36m[Gateway] Attempting to Resume session (seq: ${this.latestSequence})...\x1b[0m`);
                 this.sendPacket({
                     op: 6,
                     d: {
-                        token: USER_TOKEN,
+                        token: this.token,
                         session_id: this.sessionId,
                         seq: this.latestSequence
                     }
                 });
             } else {
-                // OP 2: Identify
                 this.sendPacket({
                     op: 2,
                     d: {
-                        token: USER_TOKEN,
+                        token: this.token,
                         intents: 1,
                         properties: { $os: 'Windows', $browser: 'Firefox', $device: '' }
                     }
@@ -583,48 +818,35 @@ class GatewayManager {
                     this.latestSequence = packet.s;
                 }
 
-                // OP 10: Hello
                 if (packet.op === 10) {
                     const interval = packet.d.heartbeat_interval;
                     this.heartbeatAcked = true;
                     this.clearHeartbeat();
 
-                    // Initial jitter
                     const jitter = Math.floor(interval * Math.random());
                     setTimeout(() => {
                         this.sendHeartbeat();
                         this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), interval);
                     }, jitter);
-                }
-                // OP 11: Heartbeat ACK
-                else if (packet.op === 11) {
+                } else if (packet.op === 11) {
                     this.heartbeatAcked = true;
-                }
-                // OP 7: Reconnect
-                else if (packet.op === 7) {
-                    console.log("\x1b[33m[Gateway] Server requested reconnect (OP 7). Reconnecting...\x1b[0m");
+                } else if (packet.op === 7) {
                     this.reconnect(true);
-                }
-                // OP 9: Invalid Session
-                else if (packet.op === 9) {
+                } else if (packet.op === 9) {
                     const canResume = packet.d === true;
-                    console.log(`\x1b[33m[Gateway] Invalid Session (OP 9). Resumable: ${canResume}\x1b[0m`);
                     if (!canResume) {
                         this.sessionId = null;
                         this.latestSequence = null;
                     }
                     this.reconnect(canResume);
-                }
-                // Dispatch events (OP 0)
-                else if (packet.op === 0) {
+                } else if (packet.op === 0) {
                     if (packet.t === 'READY') {
                         this.sessionId = packet.d.session_id;
                         if (packet.d.resume_gateway_url) {
                             this.resumeGatewayUrl = packet.d.resume_gateway_url;
                         }
-                        console.log(`\x1b[32m[Gateway] Ready! Logged in as ${packet.d.user.username}\x1b[0m`);
+                        console.log(`\x1b[32m[Gateway-${this.accountName}] Ready! Monitoring ${packet.d.guilds?.length || 0} mutual guild(s).\x1b[0m`);
 
-                        // Cache initial vanity states for all mutual guilds
                         if (Array.isArray(packet.d.guilds)) {
                             for (const g of packet.d.guilds) {
                                 if (g.id && g.vanity_url_code) {
@@ -633,7 +855,7 @@ class GatewayManager {
                             }
                         }
                     } else if (packet.t === 'RESUMED') {
-                        console.log("\x1b[32m[Gateway] Session resumed successfully.\x1b[0m");
+                        console.log(`\x1b[32m[Gateway-${this.accountName}] Session resumed.\x1b[0m`);
                     } else if (packet.t === 'GUILD_CREATE') {
                         const g = packet.d;
                         if (g.id && g.vanity_url_code) {
@@ -645,44 +867,17 @@ class GatewayManager {
                         const currentVanity = guild.vanity_url_code;
                         this.guildVanities.set(guild.id, currentVanity);
 
-                        // CASE 1: Guarding TARGET_GUILD_ID (Your own server)
-                        if (guild.id === TARGET_GUILD_ID) {
-                            if (this.activeCode && currentVanity !== this.activeCode) {
-                                console.log(`\x1b[31m[Guard] 🚨 ALERT! Own server URL dropped/changed to '${currentVanity || "NONE"}'! RE-CLAIMING '${this.activeCode}' NOW!\x1b[0m`);
-                                await sendWebhook("🚨 GUARD TRIGGERED", `URL dropped to **${currentVanity || "NONE"}**. Re-claiming **${this.activeCode}** immediately!`, 0xFF0000, true);
-                                await tryClaim(this.activeCode, true);
-                            }
-                        }
-                        // CASE 2: External Guild dropped one of our target vanities!
-                        else {
-                            for (const targetCode of VANITY_CODES) {
-                                // If this guild previously had our target code and now dropped or changed it
-                                const hadTarget = (previousVanity === targetCode);
-                                const lostTarget = (currentVanity !== targetCode);
-
-                                if (hadTarget && lostTarget) {
-                                    console.log(`\x1b[32m[Gateway Snipe] 🎯 EXTERNAL DROP DETECTED! Guild '${guild.name}' dropped '${targetCode}'! SNIPING NOW...\x1b[0m`);
-                                    await sendWebhook("🎯 EXTERNAL DROP DETECTED", `Guild **${guild.name}** dropped **${targetCode}**! Claiming immediately!`, 0x00FF00, true);
-                                    const success = await tryClaim(targetCode, true);
-                                    if (success) {
-                                        this.activeCode = targetCode;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        this.onDrop(guild, previousVanity, currentVanity, this.accountName);
                     }
                 }
             } catch (err) {
-                console.log(`\x1b[31m[Gateway] Message Parse Error: ${err.message}\x1b[0m`);
+                console.log(`\x1b[31m[Gateway-${this.accountName}] Message Error: ${err.message}\x1b[0m`);
             }
         });
 
         this.ws.on('close', (code, reason) => {
             this.clearHeartbeat();
             if (!this.shouldReconnect) return;
-
-            console.log(`\x1b[33m[Gateway] Connection closed (${code}: ${reason || 'No reason'}). Reconnecting in 3s...\x1b[0m`);
             setTimeout(() => {
                 if (this.shouldReconnect) this.connect();
             }, 3000);
@@ -697,11 +892,9 @@ class GatewayManager {
 
     sendHeartbeat() {
         if (!this.heartbeatAcked) {
-            console.log("\x1b[31m[Gateway] Heartbeat ACK missed! Connection zombied. Reconnecting...\x1b[0m");
             this.reconnect(true);
             return;
         }
-
         this.heartbeatAcked = false;
         this.sendPacket({ op: 1, d: this.latestSequence });
     }
@@ -725,10 +918,6 @@ class GatewayManager {
         }
     }
 
-    setActiveCode(code) {
-        this.activeCode = code;
-    }
-
     stop() {
         this.shouldReconnect = false;
         this.clearHeartbeat();
@@ -739,32 +928,130 @@ class GatewayManager {
     }
 }
 
-const gateway = new GatewayManager();
+class MultiGatewayManager {
+    constructor() {
+        this.clients = [];
+        this.activeCode = VANITY_CODE;
+    }
+
+    start(codeToGuard) {
+        this.activeCode = codeToGuard || VANITY_CODE;
+        if (this.clients.length > 0) {
+            console.log(`\x1b[35m[Multi-Gateway] Active code updated: '${this.activeCode}' across ${this.clients.length} token client(s).\x1b[0m`);
+            return;
+        }
+
+        console.log(`\x1b[36m[Multi-Gateway] Spawning Gateway clients for ${USER_TOKENS.length} account(s)...\x1b[0m`);
+
+        for (let i = 0; i < USER_TOKENS.length; i++) {
+            const token = USER_TOKENS[i];
+            const accName = validatedAccounts[i]?.user?.username || `Token-${i + 1}`;
+
+            const client = new GatewayClient(token, accName, (guild, prevVanity, currVanity, accountName) => {
+                this.handleGuildUpdate(guild, prevVanity, currVanity, accountName);
+            });
+            client.connect();
+            this.clients.push(client);
+        }
+    }
+
+    async handleGuildUpdate(guild, previousVanity, currentVanity, accountName) {
+        // CASE 1: Guarding any of our target guilds
+        if (TARGET_GUILD_IDS.includes(guild.id)) {
+            if (this.activeCode && currentVanity !== this.activeCode) {
+                console.log(`\x1b[31m[Guard] 🚨 ALERT via ${accountName}! Target Guild '${guild.name}' (${guild.id}) URL changed to '${currentVanity || "NONE"}'! Re-claiming '${this.activeCode}' NOW!\x1b[0m`);
+                await sendWebhook("🚨 GUARD TRIGGERED", `Target Guild **${guild.name}** lost vanity **${this.activeCode}**! Re-claiming!`, 0xFF0000, true);
+                await tryClaim(this.activeCode, guild.id, true);
+            }
+        }
+        // CASE 2: External Guild dropped target code
+        else {
+            for (const targetCode of VANITY_CODES) {
+                const hadTarget = (previousVanity === targetCode);
+                const lostTarget = (currentVanity !== targetCode);
+
+                if (hadTarget && lostTarget) {
+                    console.log(`\x1b[32m[Gateway Snipe] 🎯 DROP DETECTED by ${accountName}! Guild '${guild.name}' dropped '${targetCode}'! SNIPING NOW...\x1b[0m`);
+                    await sendWebhook("🎯 EXTERNAL DROP DETECTED", `Account **${accountName}** detected Guild **${guild.name}** dropped **${targetCode}**!`, 0x00FF00, true);
+
+                    // Claim on primary target guild (or find first target guild needing vanity)
+                    for (const targetGuildId of TARGET_GUILD_IDS) {
+                        const success = await tryClaim(targetCode, targetGuildId, true);
+                        if (success) {
+                            this.activeCode = targetCode;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    setActiveCode(code) {
+        this.activeCode = code;
+    }
+
+    stop() {
+        for (const client of this.clients) {
+            client.stop();
+        }
+        this.clients = [];
+    }
+}
+
+const multiGateway = new MultiGatewayManager();
+
+// --- CONFIG DISPLAY ---
+
+const printConfig = () => {
+    const vanityStr = VANITY_CODES.join(", ") || "MISSING";
+    const displayVanity = vanityStr.length > 36 ? vanityStr.substring(0, 33) + "..." : vanityStr;
+
+    const tokenSummary = `${USER_TOKENS.length} Token(s) Loaded`;
+    const guildSummary = `${TARGET_GUILD_IDS.length} Guild(s) Loaded`;
+    const proxyStatus = activeProxy ? `✅ ${activeProxy.host}:${activeProxy.port} (${activeProxy.latency || 0}ms)` : "❌ Direct Connection";
+
+    console.log(`
+    \x1b[36m┌──────────────────────┬──────────────────────────────────────┐
+    │ \x1b[1mCONFIGURATION\x1b[0m\x1b[36m        │ \x1b[1mSTATUS\x1b[0m\x1b[36m                               │
+    ├──────────────────────┼──────────────────────────────────────┤
+    │ Tokens               │ \x1b[32m${tokenSummary.padEnd(36)}\x1b[36m │
+    │ Target Guilds        │ \x1b[33m${guildSummary.padEnd(36)}\x1b[36m │
+    │ Vanity URL(s)        │ \x1b[35m${displayVanity.padEnd(36)}\x1b[36m │
+    │ Password             │ ${USER_PASSWORD ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
+    │ Proxy                │ \x1b[32m${proxyStatus.padEnd(36)}\x1b[36m │
+    │ Webhook              │ ${WEBHOOK_URL ? "\x1b[32m✅ Loaded\x1b[36m                           " : "\x1b[31m❌ MISSING\x1b[36m                          "} │
+    └──────────────────────┴──────────────────────────────────────┘\x1b[0m`);
+
+    console.log(`    \x1b[33mTarget Guilds:\x1b[0m ${TARGET_GUILD_IDS.join(', ')}`);
+    console.log(`    \x1b[35mTarget Vanities:\x1b[0m ${vanityStr}\n`);
+};
 
 // --- MODES ---
 
 async function modeInstant() {
     await sendWebhook("🚀 Sniper Started", "Mode: Instant Snipe", 0xFFFF00);
-    const guildOK = await verifyGuild();
-    if (!guildOK) {
-        console.log("Aborting Snipe due to invalid Guild ID.");
+    const guildsOK = await verifyGuilds();
+    if (!guildsOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
         return;
     }
 
     const authResult = await authenticateMfa();
     if (authResult === "ALREADY_CLAIMED") {
-        rl.question("\nVanity already secured on guild! Press Enter to return...", () => showMenu());
+        rl.question("\nVanity already claimed on primary guild! Press Enter to return...", () => showMenu());
         return;
     }
 
     console.log(`\x1b[36m[Instant] 🔄 Checking list: ${VANITY_CODES.join(', ')}\x1b[0m`);
     for (const code of VANITY_CODES) {
-        const success = await tryClaim(code, false);
-        if (success) {
-            console.log("\x1b[32mClaim completed successfully! Exiting...\x1b[0m");
-            await new Promise(r => setTimeout(r, 1000));
-            process.exit(0);
+        for (const guildId of TARGET_GUILD_IDS) {
+            const success = await tryClaim(code, guildId, false);
+            if (success) {
+                console.log("\x1b[32mClaim completed successfully! Exiting...\x1b[0m");
+                await new Promise(r => setTimeout(r, 1000));
+                process.exit(0);
+            }
         }
         await new Promise(r => setTimeout(r, 200));
     }
@@ -772,39 +1059,40 @@ async function modeInstant() {
 }
 
 async function modeGateway() {
-    await sendWebhook("🚀 Sniper Started", "Mode: Gateway Sniper (Guard Active)", 0xFFFF00);
-    const guildOK = await verifyGuild();
-    if (!guildOK) {
+    await sendWebhook("🚀 Sniper Started", "Mode: Gateway Sniper (Multi-Token Guard Active)", 0xFFFF00);
+    const guildsOK = await verifyGuilds();
+    if (!guildsOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
         return;
     }
 
     const authResult = await authenticateMfa();
     if (authResult === "ALREADY_CLAIMED") {
-        console.log(`\x1b[35m[Gateway] 🛡️ Vanity '${VANITY_CODE}' is already claimed! Starting Guard.\x1b[0m`);
-        gateway.start(VANITY_CODE);
+        console.log(`\x1b[35m[Gateway] 🛡️ Vanity '${VANITY_CODE}' is already claimed! Starting Multi-Token Guard.\x1b[0m`);
+        multiGateway.start(VANITY_CODE);
         return;
     }
 
     console.log(`\x1b[36m[Gateway] 📡 Monitoring for: ${VANITY_CODES.join(', ')}\x1b[0m`);
 
     for (const code of VANITY_CODES) {
-        const success = await tryClaim(code, true);
-        if (success) {
-            gateway.start(code);
-            return;
+        for (const guildId of TARGET_GUILD_IDS) {
+            const success = await tryClaim(code, guildId, true);
+            if (success) {
+                multiGateway.start(code);
+                return;
+            }
         }
         await new Promise(r => setTimeout(r, 200));
     }
 
-    // Default to watching primary target
-    gateway.start(VANITY_CODE);
+    multiGateway.start(VANITY_CODE);
 }
 
 async function modeAggressive() {
     await sendWebhook("🚀 Sniper Started", "Mode: Aggressive Mode (High Speed)", 0xFFFF00);
-    const guildOK = await verifyGuild();
-    if (!guildOK) {
+    const guildsOK = await verifyGuilds();
+    if (!guildsOK) {
         rl.question("\nPress Enter to return...", () => showMenu());
         return;
     }
@@ -812,17 +1100,16 @@ async function modeAggressive() {
     const authResult = await authenticateMfa();
     if (authResult === "ALREADY_CLAIMED") {
         console.log(`\x1b[35m[Aggressive] 🛡️ Vanity '${VANITY_CODE}' is already active! Starting Guard.\x1b[0m`);
-        gateway.start(VANITY_CODE);
+        multiGateway.start(VANITY_CODE);
         return;
     }
 
-    // Start Gateway for real-time backup events
-    gateway.start(VANITY_CODE);
+    multiGateway.start(VANITY_CODE);
 
-    console.log(`\x1b[36m[Aggressive] 🚀 STARTING MONITORING FOR: ${VANITY_CODES.join(', ')}\x1b[0m`);
+    console.log(`\x1b[36m[Aggressive] 🚀 STARTING MONITORING FOR: ${VANITY_CODES.join(', ')} across ${TARGET_GUILD_IDS.length} guild(s)\x1b[0m`);
     console.log(`\x1b[33mPress Ctrl+C to stop.\x1b[0m`);
 
-    const CHECK_INTERVAL = 150; // Stable polling interval to protect from 429 bans
+    const CHECK_INTERVAL = 150;
     let nextCheckTime = Date.now();
     let checks = 0;
     const statsShowInterval = 25;
@@ -832,39 +1119,39 @@ async function modeAggressive() {
         if (now >= nextCheckTime) {
             checks++;
 
-            // Query current guild vanity once per cycle
-            const res = await sendHttpRequest('GET', `/api/v9/guilds/${TARGET_GUILD_ID}/vanity-url`, null, {}, false);
+            for (const guildId of TARGET_GUILD_IDS) {
+                const res = await sendHttpRequest('GET', `/api/v9/guilds/${guildId}/vanity-url`, null, {}, false);
 
-            if (res.statusCode === 429) {
-                const retryAfter = res.json?.retry_after || parseFloat(res.headers['retry-after']) || 2;
-                console.log(`\n\x1b[33m[Aggressive] ⏳ Rate limit reached (429). Pausing for ${retryAfter}s...\x1b[0m`);
-                await new Promise(r => setTimeout(r, Math.ceil(retryAfter * 1000)));
-                nextCheckTime = Date.now() + CHECK_INTERVAL;
-                continue;
-            }
+                if (res.statusCode === 429) {
+                    const retryAfter = res.json?.retry_after || parseFloat(res.headers['retry-after']) || 2;
+                    console.log(`\n\x1b[33m[Aggressive] ⏳ Rate limit reached (429). Pausing for ${retryAfter}s...\x1b[0m`);
+                    await new Promise(r => setTimeout(r, Math.ceil(retryAfter * 1000)));
+                    nextCheckTime = Date.now() + CHECK_INTERVAL;
+                    break;
+                }
 
-            if (res.statusCode === 200 && res.json) {
-                const currentVanity = res.json.code;
-                if (currentVanity && VANITY_CODES.includes(currentVanity)) {
-                    // One of our target vanities is currently secured
-                    gateway.setActiveCode(currentVanity);
-                } else {
-                    console.log(`\n\x1b[31m[Aggressive] 🚨 Current vanity is '${currentVanity || "NONE"}'. Target missing! Claiming...\x1b[0m`);
-                    for (const code of VANITY_CODES) {
-                        const success = await tryClaim(code, true);
-                        if (success) {
-                            gateway.setActiveCode(code);
-                            return;
+                if (res.statusCode === 200 && res.json) {
+                    const currentVanity = res.json.code;
+                    if (currentVanity && VANITY_CODES.includes(currentVanity)) {
+                        multiGateway.setActiveCode(currentVanity);
+                    } else {
+                        console.log(`\n\x1b[31m[Aggressive] 🚨 Guild ${guildId} vanity is '${currentVanity || "NONE"}'. Target missing! Claiming...\x1b[0m`);
+                        for (const code of VANITY_CODES) {
+                            const success = await tryClaim(code, guildId, true);
+                            if (success) {
+                                multiGateway.setActiveCode(code);
+                                return;
+                            }
                         }
                     }
-                }
-            } else if (res.statusCode === 404) {
-                console.log(`\n\x1b[31m[Aggressive] 🚨 Guild currently has no vanity! Claiming...\x1b[0m`);
-                for (const code of VANITY_CODES) {
-                    const success = await tryClaim(code, true);
-                    if (success) {
-                        gateway.setActiveCode(code);
-                        return;
+                } else if (res.statusCode === 404) {
+                    console.log(`\n\x1b[31m[Aggressive] 🚨 Guild ${guildId} has no vanity! Claiming...\x1b[0m`);
+                    for (const code of VANITY_CODES) {
+                        const success = await tryClaim(code, guildId, true);
+                        if (success) {
+                            multiGateway.setActiveCode(code);
+                            return;
+                        }
                     }
                 }
             }
@@ -922,19 +1209,17 @@ async function modeScheduled() {
         }
     }, 1000);
 
-    // Main wait loop
     while (true) {
         const now = Date.now();
         const diff = targetTs - now;
 
-        // Pre-arm MFA at T-60s
         if (diff <= 60000 && !mfaPreArmed) {
             mfaPreArmed = true;
             console.log("\n\x1b[36m[Grace Tracker] 🛡️ Pre-arming MFA verification (T-60s)...\x1b[0m");
             await authenticateMfa();
         }
 
-        if (diff <= 10000) { // 10 seconds before target
+        if (diff <= 10000) {
             clearInterval(countdown);
             console.log(`\n\x1b[31m[Grace Tracker] 🚨 T-10 SECONDS! INITIATING BURST MODE NOW!\x1b[0m`);
             await sendWebhook("🚨 BURST MODE", "Scheduled target is 10 seconds away! Starting burst claim attempts.", 0xFF0000);
@@ -942,15 +1227,17 @@ async function modeScheduled() {
             const burstInterval = 50;
             let nextBurst = Date.now();
 
-            while (Date.now() < targetTs + 5000) { // Run until 5s after target
+            while (Date.now() < targetTs + 5000) {
                 const current = Date.now();
                 if (current >= nextBurst) {
                     for (const code of VANITY_CODES) {
-                        const success = await tryClaim(code, false);
-                        if (success) {
-                            console.log(`\x1b[32m!!! SUCCESS !!! SCHEDULED SNIPE VICTORY: ${code} !\x1b[0m`);
-                            await new Promise(r => setTimeout(r, 1000));
-                            process.exit(0);
+                        for (const guildId of TARGET_GUILD_IDS) {
+                            const success = await tryClaim(code, guildId, false);
+                            if (success) {
+                                console.log(`\x1b[32m!!! SUCCESS !!! SCHEDULED SNIPE VICTORY: ${code} on ${guildId} !\x1b[0m`);
+                                await new Promise(r => setTimeout(r, 1000));
+                                process.exit(0);
+                            }
                         }
                     }
                     nextBurst = current + burstInterval;
@@ -980,10 +1267,10 @@ function showMenu() {
     Created by Spectral.\x1b[0m
     `);
     console.log("\x1b[36m1. Instant Snipe (Try to claim NOW)\x1b[0m");
-    console.log("\x1b[36m2. Gateway Sniper (Listen for URL changes)\x1b[0m");
+    console.log("\x1b[36m2. Gateway Sniper (Multi-Token Real-time Listener)\x1b[0m");
     console.log("\x1b[36m3. Aggressive Mode (High Speed Monitoring)\x1b[0m");
     console.log("\x1b[36m4. Grace Period Tracker (Scheduled Snipe)\x1b[0m");
-    console.log("\x1b[36m5. Configuration Check\x1b[0m");
+    console.log("\x1b[36m5. Configuration & Proxy Check\x1b[0m");
     console.log("\x1b[31m6. Exit\x1b[0m");
 
     rl.question("\n\x1b[33mSelect Mode (1-6): \x1b[0m", handleMenu);
@@ -993,7 +1280,7 @@ async function handleMenu(option) {
     if (option === '1') {
         await modeInstant();
     } else if (option === '2') {
-        console.log("Starting Gateway Sniper...");
+        console.log("Starting Multi-Token Gateway Sniper...");
         await modeGateway();
     } else if (option === '3') {
         await modeAggressive();
@@ -1001,19 +1288,29 @@ async function handleMenu(option) {
         await modeScheduled();
     } else if (option === '5') {
         printConfig();
+        await verifyTokens();
+        await verifyGuilds();
         rl.question("\nPress Enter to return...", () => showMenu());
     } else if (option === '6') {
         console.log("Exiting...");
-        gateway.stop();
+        multiGateway.stop();
         process.exit(0);
     } else {
         showMenu();
     }
 }
 
-if (!USER_TOKEN || !TARGET_GUILD_ID || !USER_PASSWORD || VANITY_CODES.length === 0) {
-    console.error("\x1b[31m[Config Error] Missing required variables in .env (TOKEN, GUILD_ID, PASSWORD, VANITY_URL)!\x1b[0m");
-    process.exit(1);
+async function bootstrap() {
+    if (USER_TOKENS.length === 0 || TARGET_GUILD_IDS.length === 0 || !USER_PASSWORD || VANITY_CODES.length === 0) {
+        console.error("\x1b[31m[Config Error] Missing required variables in .env (TOKEN, GUILD_ID, PASSWORD, VANITY_URL)!\x1b[0m");
+        process.exit(1);
+    }
+
+    // 1. Initialize and test proxies
+    activeProxy = await initProxies();
+
+    // 2. Start menu
+    showMenu();
 }
 
-showMenu();
+bootstrap();
